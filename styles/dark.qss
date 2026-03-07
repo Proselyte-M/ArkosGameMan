@@ -1,0 +1,148 @@
+QWidget {
+  background: #10131a;
+  color: #d8deef;
+  font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+  font-size: 13px;
+}
+QLabel {
+  background: transparent;
+}
+QLabel#sectionTitle {
+  font-size: 15px;
+  font-weight: 600;
+  padding: 4px 2px;
+  color: #e3e9f8;
+}
+QLabel#previewLabel {
+  background: #0e141f;
+  border: 1px solid #2a354b;
+  border-radius: 10px;
+  padding: 14px;
+  color: #b5c3df;
+}
+QMainWindow {
+  background: #0d1117;
+}
+QFrame {
+  background: #141a24;
+  border: 1px solid #202a3a;
+  border-radius: 12px;
+}
+QMenuBar {
+  background: #111722;
+  border: none;
+}
+QMenuBar::item {
+  padding: 6px 10px;
+}
+QMenuBar::item:selected {
+  background: #1d2636;
+  border-radius: 6px;
+}
+QLineEdit,
+QPlainTextEdit,
+QListWidget,
+QTableWidget,
+QComboBox {
+  background: #0f1520;
+  border: 1px solid #2a354b;
+  border-radius: 10px;
+  padding: 7px 10px;
+  min-height: 22px;
+}
+QLineEdit:focus,
+QPlainTextEdit:focus,
+QListWidget:focus,
+QTableWidget:focus,
+QComboBox:focus {
+  border: 1px solid #7aa2f7;
+}
+QPushButton,
+QToolButton {
+  background: #1b2333;
+  border: 1px solid #2f3e5c;
+  border-radius: 10px;
+  padding: 8px 12px;
+}
+QPushButton:hover,
+QToolButton:hover {
+  background: #26344d;
+}
+QPushButton:pressed,
+QToolButton:pressed {
+  background: #314261;
+}
+QPushButton:disabled {
+  color: #6f7d95;
+  border-color: #2a3346;
+}
+QHeaderView::section {
+  background: #151d2b;
+  border: none;
+  border-right: 1px solid #223049;
+  border-bottom: 1px solid #223049;
+  padding: 8px;
+}
+QTableWidget {
+  gridline-color: #20304a;
+  alternate-background-color: #141b28;
+}
+QTableWidget::item:selected,
+QListWidget::item:selected {
+  background: #2a3b5e;
+  border-radius: 6px;
+}
+QStatusBar {
+  background: #0f1520;
+  border-top: 1px solid #24334f;
+}
+QStatusBar QLabel {
+  color: #95a7c9;
+}
+QProgressBar {
+  border: 1px solid #2f3f5d;
+  border-radius: 8px;
+  text-align: center;
+  background: #131b29;
+}
+QProgressBar::chunk {
+  background: #7aa2f7;
+  border-radius: 7px;
+}
+QSplitter::handle {
+  background: #27354f;
+}
+QScrollArea {
+  border: none;
+  background: transparent;
+}
+QCheckBox#iosSwitch {
+  spacing: 0px;
+  min-width: 46px;
+  min-height: 26px;
+  max-width: 46px;
+  max-height: 26px;
+}
+QCheckBox#iosSwitch::indicator {
+  width: 46px;
+  height: 26px;
+  border-radius: 13px;
+  background: #3a455e;
+  border: 1px solid #4a5673;
+}
+QCheckBox#iosSwitch::indicator:checked {
+  background: #4d87ff;
+  border: 1px solid #4d87ff;
+}
+QCheckBox#iosSwitch::indicator:unchecked {
+  background: #3a455e;
+  border: 1px solid #4a5673;
+}
+QToolButton#videoMuteButton {
+  background: rgba(16, 21, 32, 170);
+  border: 1px solid rgba(122, 162, 247, 180);
+  border-radius: 14px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 2px;
+}
