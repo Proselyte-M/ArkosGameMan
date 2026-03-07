@@ -15,6 +15,7 @@ from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import QApplication, QProgressDialog
 
 from arkos_core import ArkosService, GameEntry
+from emulator_config import EmulatorConfigStore
 from i18n import tr
 from qt_view import MainWindow
 from updater import (
@@ -53,9 +54,11 @@ class ArkosController:
         self._header_sort_asc = True
         self.current_theme = "dark"
         self.current_language = "zh"
+        self._emulator_store = EmulatorConfigStore(self._settings_file)
         self._update_repo = self._load_update_repo()
         self._update_check_enabled = self._load_update_enabled()
         self._update_check_started = False
+        self._emulator_configs = self._emulator_store.load()
         self._update_download_cancel = threading.Event()
         self._update_dialog: QProgressDialog | None = None
         self._update_latest: dict[str, str] | None = None
@@ -292,6 +295,7 @@ class ArkosController:
         self.view.request_toggle_favorite.connect(self._toggle_favorite_by_row)
         self.view.request_import_media.connect(self._import_media)
         self.view.request_language_changed.connect(self._on_language_changed)
+        self.view.request_open_emulator_settings.connect(self._open_emulator_settings)
 
     def show(self) -> None:
         self.view.show()
@@ -529,6 +533,90 @@ class ArkosController:
             return
         if action == "feature":
             self.view.notify(self._t("notify.tip"), self._t("notify.feature_reserved"))
+            return
+        if action == "run_emulator":
+            self._run_game_with_emulator(selected)
+
+    def _open_emulator_settings(self) -> None:
+        edited = self.view.show_emulator_settings_dialog(self._emulator_configs)
+        if edited is None:
+            return
+        self._emulator_configs = edited
+        self._emulator_store.save(edited)
+        self.view.notify(self._t("notify.success"), self._t("notify.emulator_settings_saved"))
+
+    def _run_game_with_emulator(self, game: GameEntry) -> None:
+        system = self._game_system(game) or self.service.current_system
+        if not system:
+            self.view.notify(self._t("notify.tip"), self._t("notify.select_system_game_first"), error=True)
+            return
+        resolved = self._emulator_store.resolve_profile(system, self._emulator_configs)
+        if resolved is None:
+            self.view.notify(self._t("notify.tip"), self._t("notify.emulator_config_missing", system=system), error=True)
+            return
+        profile, conf = resolved
+        rom_abs = self.service.repo.rel_to_abs(system, game.path)
+        if not rom_abs.exists():
+            self.view.notify(self._t("notify.failed"), self._t("notify.file_not_found", path=rom_abs), error=True)
+            return
+        if conf.use_bundled and profile.profile_id == "fc":
+            self._run_builtin_fc_emulator(rom_abs)
+            return
+        if conf.use_bundled and profile.profile_id != "fc":
+            self.view.notify(
+                self._t("notify.tip"),
+                self._t("notify.bundled_profile_not_ready", profile=profile.title),
+                error=True,
+            )
+            return
+        emulator_path = conf.emulator_path.strip()
+        launch_command = conf.launch_command.strip() or '{emulator} "{rom}"'
+        if not emulator_path:
+            self.view.notify(
+                self._t("notify.tip"),
+                self._t("notify.emulator_path_missing", profile=profile.title, system=system),
+                error=True,
+            )
+            return
+        try:
+            cmd_text = launch_command.format(
+                emulator=emulator_path,
+                rom=str(rom_abs),
+                system=system,
+                profile=profile.profile_id,
+                core=profile.recommended_cores[0] if profile.recommended_cores else "",
+            )
+            emulator_dir = Path(emulator_path).parent if Path(emulator_path).parent.exists() else None
+            subprocess.Popen(cmd_text, cwd=emulator_dir, shell=True)
+            logger.info("通过模拟器启动游戏: profile=%s, system=%s, rom=%s", profile.profile_id, system, rom_abs)
+        except Exception as exc:
+            logger.exception("模拟器启动失败: system=%s, rom=%s", system, rom_abs)
+            self.view.notify(
+                self._t("notify.failed"),
+                self._t("notify.emulator_launch_failed", error=exc),
+                error=True,
+            )
+
+    def _run_builtin_fc_emulator(self, rom_abs: Path) -> None:
+        script_candidates = [
+            Path(__file__).resolve().parent / "builtin_fc_emulator.py",
+            Path(sys.executable).resolve().parent / "builtin_fc_emulator.py",
+        ]
+        script_path = next((path for path in script_candidates if path.exists()), None)
+        if script_path is None:
+            self.view.notify(self._t("notify.failed"), self._t("notify.builtin_fc_missing"), error=True)
+            return
+        launcher = "python" if getattr(sys, "frozen", False) else sys.executable
+        try:
+            subprocess.Popen([launcher, str(script_path), str(rom_abs)], cwd=script_path.parent)
+            logger.info("启动内置FC模拟器: rom=%s, script=%s", rom_abs, script_path)
+        except Exception as exc:
+            logger.exception("启动内置FC模拟器失败: rom=%s", rom_abs)
+            self.view.notify(
+                self._t("notify.failed"),
+                self._t("notify.emulator_launch_failed", error=exc),
+                error=True,
+            )
 
     def _reveal_file(self, target_file: Path) -> None:
         if not target_file.exists():

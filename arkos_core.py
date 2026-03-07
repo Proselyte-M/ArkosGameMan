@@ -23,6 +23,9 @@ EXCLUDED_SYSTEM_DIRS = {
     "launchimages",
     "savestates",
     "themes",
+    "mod",
+    "tools",
+    
 }
 MEDIA_SUBDIRS = ("covers", "screenshots", "videos", "thumbnails")
 NON_ROM_EXTENSIONS = {
@@ -38,6 +41,7 @@ NON_ROM_EXTENSIONS = {
     ".txt",
     ".nfo",
     ".db",
+    ".srm",
 }
 EDITABLE_FIELDS = [
     "name",
@@ -90,9 +94,34 @@ class ArkosRepository:
             return []
         systems = []
         for item in self.roms_root.iterdir():
-            if item.is_dir() and item.name.lower() not in EXCLUDED_SYSTEM_DIRS and not item.name.startswith("."):
+            if (
+                item.is_dir()
+                and item.name.lower() not in EXCLUDED_SYSTEM_DIRS
+                and not item.name.startswith(".")
+                and self._system_has_games(item.name)
+            ):
                 systems.append(item.name)
         return sorted(systems, key=str.lower)
+
+    def _system_has_games(self, system: str) -> bool:
+        if self.list_rom_files(system):
+            return True
+        gpath = self.gamelist_path(system)
+        if not gpath.exists():
+            return False
+        try:
+            for _event, elem in ET.iterparse(gpath, events=("end",)):
+                if elem.tag != "game":
+                    continue
+                path_text = (elem.findtext("path") or "").strip()
+                if path_text:
+                    file_name = Path(path_text).name.lower()
+                    if file_name not in {"gamelist.xml", "gamelist.xml.old"}:
+                        return True
+                elem.clear()
+        except Exception:
+            return False
+        return False
 
     def system_dir(self, system: str) -> Path:
         return self.roms_root / system

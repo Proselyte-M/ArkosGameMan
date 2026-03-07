@@ -2,130 +2,128 @@ name: Build Windows EXE & Create Release
 
 on:
   push:
-    branches: [main, master]
-    tags: ['v*']  # 监听v开头的标签推送（触发Release创建）
+    branches: [main, master]  # 推送代码到主分支触发
   workflow_dispatch:  # 支持手动触发
 
 jobs:
   build-exe:
     runs-on: windows-latest
     timeout-minutes: 20
-    # 强化权限配置：解决403权限问题
     permissions:
-      contents: write  # 必须：创建Release的核心权限
-      packages: write  # 可选：防止后续扩展权限不足
-      pull-requests: write  # 可选：兜底
+      contents: write  # 必须：打标签/创建 Release 权限
+      packages: write
+      pull-requests: write
 
     steps:
       - name: Checkout repository code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 拉取完整仓库历史，确保标签识别正常
+          fetch-depth: 0  # 拉取完整仓库历史，允许打标签
 
+      # 新增：从根目录 version.py 提取版本号（适配目录结构）
+      - name: Extract version from version.py (root)
+        id: extract_version
+        run: |
+          # 确认 version.py 在根目录（Actions 中仓库根目录是默认工作目录）
+          if (-not (Test-Path "version.py")) {
+            Write-Error "根目录未找到 version.py 文件"
+            exit 1
+          }
+          # 读取并提取 APP_VERSION
+          $content = Get-Content -Path "version.py" -Raw
+          $match = [regex]::Match($content, 'APP_VERSION\s*=\s*["\']([0-9.]+)["\']')
+          if (-not $match.Success) {
+            Write-Error "version.py 中未找到 APP_VERSION 定义"
+            exit 1
+          }
+          $VERSION = $match.Groups[1].Value.Trim()
+          $TAG_NAME = "v$VERSION"
+          
+          # 输出到环境变量供后续步骤使用
+          echo "version=$VERSION" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          echo "tag_name=$TAG_NAME" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          
+          Write-Host "✅ 从根目录 version.py 提取到版本号：$VERSION，标签名：$TAG_NAME"
+        shell: pwsh
+
+      # 新增：自动创建并推送 Git 标签（已适配根目录）
+      - name: Create and push Git tag
+        run: |
+          # 检查标签是否已存在
+          $TAG_EXISTS = git tag -l $env:TAG_NAME
+          if ($TAG_EXISTS) {
+            Write-Host "⚠️  标签 $env:TAG_NAME 已存在，跳过创建"
+          } else {
+            # 创建标签
+            git tag -a $env:TAG_NAME -m "Release $env:TAG_NAME"
+            # 推送标签到远程
+            git push origin $env:TAG_NAME
+            Write-Host "✅ 成功创建并推送标签：$env:TAG_NAME"
+          }
+        env:
+          TAG_NAME: ${{ steps.extract_version.outputs.tag_name }}
+        shell: pwsh
+
+      # 以下步骤无需修改（和之前一致）
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          # 如果你已创建requirements.txt，取消下面注释（否则保持注释）
-          # cache: "pip"
 
       - name: Install build dependencies
         run: |
-          echo "升级pip并安装依赖..."
           python -m pip install --upgrade pip
-          # 直接安装依赖（若有requirements.txt，替换为 pip install -r requirements.txt）
-          pip install pyinstaller pillow PySide6 qtawesome --verbose
-        shell: pwsh  # 使用PowerShell提升Windows兼容性
+          pip install pyinstaller pillow PySide6 qtawesome ruff mypy --verbose
+        shell: pwsh
 
       - name: Create necessary directories
         run: |
-          # 提前创建build和scripts目录，避免图标脚本报错
           if (-not (Test-Path "build")) { New-Item -ItemType Directory -Path "build" | Out-Null }
           if (-not (Test-Path "scripts")) { New-Item -ItemType Directory -Path "scripts" | Out-Null }
         shell: pwsh
 
       - name: Prepare application icon
         run: |
-          echo "执行图标处理脚本..."
           python scripts/prepare_icon.py --source logo.png --output build
         shell: pwsh
-        continue-on-error: true  # 图标脚本失败不中断整体流程
+        continue-on-error: true
 
       - name: Build EXE with PyInstaller
         run: |
-          echo "开始打包EXE文件..."
           pyinstaller `
-            --noconfirm `
-            --clean `
-            --windowed `
-            --onefile `
+            --noconfirm --clean --windowed --onefile `
             --name ArkosGameMan `
             --icon build/app_icon.ico `
-            --add-data "styles;styles" `
-            --add-data "logo.png;." `
-            --log-level=INFO `
+            --add-data "styles;styles" --add-data "logo.png;." `
             app.py
         shell: pwsh
 
       - name: Verify EXE file exists
         run: |
-          # 验证EXE是否生成，提前报错便于排查
           if (-not (Test-Path "dist/ArkosGameMan.exe")) {
-            Write-Error "打包失败：未找到dist/ArkosGameMan.exe文件"
+            Write-Error "打包失败：未找到 dist/ArkosGameMan.exe"
             exit 1
           }
-          # 输出EXE文件信息（大小、路径）
-          Get-ChildItem dist/ArkosGameMan.exe | Format-List
         shell: pwsh
 
-      - name: Upload EXE as Artifact (for test)
+      - name: Upload EXE as Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ArkosGameMan-windows-exe-${{ github.sha }}
+          name: ArkosGameMan-windows-exe-${{ steps.extract_version.outputs.tag_name }}
           path: dist/ArkosGameMan.exe
           if-no-files-found: error
-          retention-days: 30  # 产物保留30天
-
-      # 新增步骤：读取CHANGELOG.md，提取对应版本的更新日志
-      - name: Extract changelog for current version
-        id: extract_changelog
-        run: |
-          # 定义要提取的版本号（从标签名中获取，如v1.0.1）
-          $VERSION = "${{ github.ref_name }}"
-          echo "当前版本：$VERSION"
-          
-          # 读取CHANGELOG.md文件内容
-          $CHANGELOG_CONTENT = Get-Content -Path "./docs/CHANGELOG.md" -Raw
-          
-          # 正则提取对应版本的日志（匹配v1.0.1到下一个版本/日期前的内容）
-          $REGEX_PATTERN = "(?s)(v$VERSION\s+)(.*?)(?=\s*(v\d+\.\d+\.\d+|\d{4}-\d{2}|$))"
-          if ($CHANGELOG_CONTENT -match $REGEX_PATTERN) {
-              $EXTRACTED_CHANGELOG = $matches[2].Trim()
-              # 处理换行符，适配GitHub Release的Markdown格式
-              $EXTRACTED_CHANGELOG = $EXTRACTED_CHANGELOG -replace "`r`n", "`n"
-              # 将提取的日志存入环境变量，供后续步骤使用
-              echo "changelog=$EXTRACTED_CHANGELOG" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          } else {
-              # 未找到对应版本日志时的默认提示
-              echo "changelog=暂无该版本的更新日志" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          }
-        shell: pwsh
-        if: startsWith(github.ref, 'refs/tags/')  # 仅标签推送时执行
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')  # 仅标签推送时执行
         uses: softprops/action-gh-release@v2
         with:
-          name: ArkosGameMan ${{ github.ref_name }}  # Release名称（如ArkosGameMan v1.0.1）
+          name: ArkosGameMan ${{ steps.extract_version.outputs.tag_name }}
+          tag_name: ${{ steps.extract_version.outputs.tag_name }}  # 使用提取的标签名
           body: |
-            ## ArkosGameMan ${{ github.ref_name }} 发布
-            ${{ steps.extract_changelog.outputs.changelog }}
-            
-            ---
-            ### 构建信息
+            ## ArkosGameMan ${{ steps.extract_version.outputs.tag_name }} 发布
+            - 自动构建的 Windows 可执行文件
+            - 版本号：${{ steps.extract_version.outputs.version }}
             - 构建提交：${{ github.sha }}
-            - 构建时间：${{ github.event.repository.updated_at }}
-          files: ./dist/ArkosGameMan.exe  # 显式指定EXE路径（解决路径解析问题）
-          prerelease: false  # false=正式版，true=预发布版
+          files: ./dist/ArkosGameMan.exe
+          prerelease: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # 内置令牌（已授予读写权限）
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

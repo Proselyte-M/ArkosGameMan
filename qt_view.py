@@ -38,6 +38,8 @@ from PySide6.QtWidgets import (
     QStackedLayout,
 )
 
+from emulator_config import EmulatorProfileConfig
+from emulator_settings_dialog import EmulatorSettingsDialog
 from i18n import LANGUAGE_CHOICES, tr
 
 try:
@@ -206,6 +208,7 @@ class MainWindow(QMainWindow):
     request_toggle_favorite = Signal(int)
     request_import_media = Signal(str)
     request_language_changed = Signal(str)
+    request_open_emulator_settings = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -251,15 +254,20 @@ class MainWindow(QMainWindow):
         self.btn_theme = QToolButton()
         self.btn_theme.setIcon(self._icon("fa5s.moon"))
         self.btn_theme.setToolTip(self._t("button.theme.tooltip"))
+        self.btn_settings = QToolButton()
+        self.btn_settings.setIcon(self._icon("fa5s.cog"))
+        self.btn_settings.setToolTip(self._t("button.settings.tooltip"))
         self.language_combo = QComboBox()
         for code, name in LANGUAGE_CHOICES:
             self.language_combo.addItem(name, code)
         self.btn_theme.clicked.connect(self.request_toggle_theme.emit)
+        self.btn_settings.clicked.connect(self.request_open_emulator_settings.emit)
         top_layout.addWidget(self.search_edit, 2)
         top_layout.addWidget(self.btn_choose_root)
         top_layout.addWidget(self.btn_refresh)
         top_layout.addWidget(self.btn_backup)
         top_layout.addWidget(self.language_combo)
+        top_layout.addWidget(self.btn_settings)
         top_layout.addWidget(self.btn_theme)
         root_layout.addWidget(top)
 
@@ -495,6 +503,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         delete_action = menu.addAction(self._t("context.delete"))
         favorite_action = menu.addAction(self._t("context.favorite"))
+        run_emulator_action = menu.addAction(self._t("context.run_emulator"))
         feature_action = menu.addAction(self._t("context.feature"))
         chosen = menu.exec(self.games_table.viewport().mapToGlobal(pos))
         if chosen is None:
@@ -509,6 +518,8 @@ class MainWindow(QMainWindow):
             self.request_context_action.emit("delete", row)
         elif chosen == favorite_action:
             self.request_context_action.emit("favorite", row)
+        elif chosen == run_emulator_action:
+            self.request_context_action.emit("run_emulator", row)
         elif chosen == feature_action:
             self.request_context_action.emit("feature", row)
 
@@ -541,6 +552,7 @@ class MainWindow(QMainWindow):
         self.btn_rename.setText(self._t("button.rename_rom"))
         self.btn_save.setText(self._t("button.save_metadata"))
         self.btn_theme.setToolTip(self._t("button.theme.tooltip"))
+        self.btn_settings.setToolTip(self._t("button.settings.tooltip"))
         self.left_title.setText(self._t("title.system_list"))
         self.system_list.setToolTip(self._t("tooltip.system_list"))
         self.form_title.setText(self._t("title.metadata_edit"))
@@ -674,6 +686,15 @@ class MainWindow(QMainWindow):
         if not ok:
             return ""
         return text
+
+    def show_emulator_settings_dialog(
+        self,
+        state: dict[str, EmulatorProfileConfig],
+    ) -> dict[str, EmulatorProfileConfig] | None:
+        dialog = EmulatorSettingsDialog(self, self._t, state)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.get_state()
 
     def set_preview_image(self, pixmap: QPixmap | None, fallback_text: str) -> None:
         if pixmap is None:
