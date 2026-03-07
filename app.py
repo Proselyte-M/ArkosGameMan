@@ -4,6 +4,7 @@ import logging
 import sys
 
 from qt_controller import run_app
+from version import APP_VERSION
 
 
 def main() -> None:
@@ -11,8 +12,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    logging.getLogger(__name__).info("启动 ArkosGameMan v%s", APP_VERSION)
     sys.exit(run_app())
-
-#v1.0.0
 if __name__ == "__main__":
     main()

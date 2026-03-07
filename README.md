@@ -1,4 +1,5 @@
 # ArkosGameMan
+# 请注意！这是完全由AI生成并发布的应用程序！
 
 ArkosGameMan 是一个基于 PySide6 的 ArkOS 游戏库管理工具，用于管理游戏与 `gamelist.xml` 元数据。
 
@@ -13,6 +14,7 @@ ArkosGameMan 是一个基于 PySide6 的 ArkOS 游戏库管理工具，用于管
 - 预览能力：图片预览、视频预览、图片双击放大查看
 - 主题与语言：亮暗主题切换，中英日俄多语言界面
 - 列宽调节：游戏列表支持像 Excel 一样拖动表头调整列宽
+- 自动更新：后台检测 GitHub Release 新版本并支持一键下载更新
 - 日志输出：关键流程输出 INFO/ERROR 日志，便于排障
 ![主界面](pic/mainpage.png)
 ![主界面-游戏清单](pic/mainpage2.png)
@@ -32,6 +34,8 @@ ArkosGameMan/
 ├─ qt_controller.py      # 控制器层（事件编排）
 ├─ qt_view.py            # 视图层（Qt UI）
 ├─ arkos_core.py         # 模型/服务层（ROM与元数据逻辑）
+├─ updater.py            # 更新检查与下载安装逻辑
+├─ version.py            # 版本号
 ├─ i18n.py               # 多语言资源
 ├─ styles/
 │  ├─ dark.qss
@@ -58,6 +62,10 @@ python app.py
 - ROM 根目录由界面选择，并保存到 `arkosgameman.ini`
 - 每个系统目录下使用 `gamelist.xml` 保存元数据
 - 保存时会生成 `gamelist.xml.old` 作为备份
+- 可在 `arkosgameman.ini` 中配置更新检查：
+  - `[update]`
+  - `repository = 你的GitHub用户名/仓库名`
+  - `check_on_start = true`
 - 媒体相对路径示例：
   - `./media/covers/xxx.png`
   - `./media/thumbnails/xxx.png`

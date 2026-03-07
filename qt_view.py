@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, Property, QPropertyAnimation, QRectF, QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
-    QMenuBar,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -238,13 +237,6 @@ class MainWindow(QMainWindow):
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(14, 14, 14, 14)
         root_layout.setSpacing(10)
-
-        menu_bar = QMenuBar()
-        self.setMenuBar(menu_bar)
-        self.view_menu = menu_bar.addMenu(self._t("menu.view"))
-        self.action_toggle_theme = QAction(self._icon("fa5s.adjust"), self._t("action.toggle_theme"), self)
-        self.view_menu.addAction(self.action_toggle_theme)
-        self.action_toggle_theme.triggered.connect(self.request_toggle_theme.emit)
 
         top = QFrame()
         top_layout = QHBoxLayout(top)
@@ -539,8 +531,6 @@ class MainWindow(QMainWindow):
 
     def _apply_language(self) -> None:
         self.setWindowTitle(self._t("app.title"))
-        self.view_menu.setTitle(self._t("menu.view"))
-        self.action_toggle_theme.setText(self._t("action.toggle_theme"))
         self.search_edit.setPlaceholderText(self._t("search.placeholder"))
         self.search_edit.setToolTip(self._t("search.tooltip"))
         self.btn_choose_root.setText(self._t("button.choose_root"))

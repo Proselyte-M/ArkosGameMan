@@ -1,27 +1,47 @@
 from __future__ import annotations
 
 import configparser
+import os
 import logging
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QUrl
+from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QProgressDialog
 
 from arkos_core import ArkosService, GameEntry
 from i18n import tr
 from qt_view import MainWindow
+from updater import (
+    create_replace_script,
+    current_executable_path,
+    default_download_path,
+    download_file,
+    fetch_latest_release,
+    is_newer_version,
+    is_running_as_exe,
+    launch_replace_script,
+)
+from version import APP_VERSION
 
 logger = logging.getLogger(__name__)
+
+
+class UpdateBridge(QObject):
+    check_finished = Signal(object)
+    download_progress = Signal(int, int)
+    download_finished = Signal(bool, str, str, str)
 
 
 class ArkosController:
     def __init__(self) -> None:
         self.view = MainWindow()
-        self._settings_file = Path(__file__).resolve().parent / "arkosgameman.ini"
+        self._settings_file = self._resolve_settings_file()
         initial_root = self._load_last_root()
         self.service = ArkosService(initial_root)
         self.filtered_games: list[GameEntry] = []
@@ -33,6 +53,16 @@ class ArkosController:
         self._header_sort_asc = True
         self.current_theme = "dark"
         self.current_language = "zh"
+        self._update_repo = self._load_update_repo()
+        self._update_check_enabled = self._load_update_enabled()
+        self._update_check_started = False
+        self._update_download_cancel = threading.Event()
+        self._update_dialog: QProgressDialog | None = None
+        self._update_latest: dict[str, str] | None = None
+        self._update_bridge = UpdateBridge(self.view)
+        self._update_bridge.check_finished.connect(self._on_update_check_finished)
+        self._update_bridge.download_progress.connect(self._on_update_download_progress)
+        self._update_bridge.download_finished.connect(self._on_update_download_finished)
         self._theme_anim = QPropertyAnimation(self.view, b"windowOpacity", self.view)
         self._theme_anim.setDuration(180)
         self._theme_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
@@ -41,6 +71,8 @@ class ArkosController:
         self._wire_signals()
         self._apply_theme(self.current_theme, animate=False)
         self._refresh_systems()
+        if self._update_check_enabled:
+            QTimer.singleShot(2000, self._start_update_check)
 
     def _load_last_root(self) -> Path:
         parser = configparser.ConfigParser()
@@ -51,11 +83,196 @@ class ArkosController:
                 return Path(saved)
         return Path("/roms")
 
+    def _resolve_settings_file(self) -> Path:
+        project_settings = Path(__file__).resolve().parent / "arkosgameman.ini"
+        if not getattr(sys, "frozen", False):
+            return project_settings
+        appdata = os.environ.get("APPDATA", "").strip()
+        if appdata:
+            settings_dir = Path(appdata) / "ArkosGameMan"
+        else:
+            settings_dir = Path.home() / "AppData" / "Roaming" / "ArkosGameMan"
+        settings_file = settings_dir / "arkosgameman.ini"
+        if settings_file.exists():
+            return settings_file
+        legacy_candidates = [
+            Path(sys.executable).resolve().parent / "arkosgameman.ini",
+            Path.cwd() / "arkosgameman.ini",
+        ]
+        for legacy in legacy_candidates:
+            if not legacy.exists():
+                continue
+            try:
+                settings_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy, settings_file)
+                return settings_file
+            except Exception:
+                return legacy
+        return settings_file
+
     def _save_last_root(self, root_path: Path) -> None:
         parser = configparser.ConfigParser()
-        parser["app"] = {"rom_root": str(root_path)}
+        if self._settings_file.exists():
+            parser.read(self._settings_file, encoding="utf-8")
+        if "app" not in parser:
+            parser["app"] = {}
+        parser["app"]["rom_root"] = str(root_path)
+        self._settings_file.parent.mkdir(parents=True, exist_ok=True)
         with self._settings_file.open("w", encoding="utf-8") as handle:
             parser.write(handle)
+
+    def _load_update_repo(self) -> str:
+        parser = configparser.ConfigParser()
+        if self._settings_file.exists():
+            parser.read(self._settings_file, encoding="utf-8")
+        configured = parser.get("update", "repository", fallback="").strip()
+        if configured:
+            return configured
+        return self._detect_repo_from_git()
+
+    def _load_update_enabled(self) -> bool:
+        parser = configparser.ConfigParser()
+        if self._settings_file.exists():
+            parser.read(self._settings_file, encoding="utf-8")
+        return parser.getboolean("update", "check_on_start", fallback=True)
+
+    def _detect_repo_from_git(self) -> str:
+        git_cfg = Path(__file__).resolve().parent / ".git" / "config"
+        if not git_cfg.exists():
+            return ""
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(git_cfg, encoding="utf-8")
+            origin = parser.get('remote "origin"', "url", fallback="").strip()
+        except Exception:
+            return ""
+        if not origin:
+            return ""
+        if origin.startswith("git@github.com:"):
+            repo = origin.removeprefix("git@github.com:")
+        elif "github.com/" in origin:
+            repo = origin.split("github.com/", 1)[1]
+        else:
+            return ""
+        repo = repo.strip().rstrip("/")
+        if repo.lower().endswith(".git"):
+            repo = repo[:-4]
+        if "/" not in repo:
+            return ""
+        return repo
+
+    def _start_update_check(self) -> None:
+        if self._update_check_started:
+            return
+        if not self._update_repo:
+            logger.info("跳过更新检查: 未配置GitHub仓库")
+            return
+        self._update_check_started = True
+        threading.Thread(target=self._check_update_worker, daemon=True).start()
+
+    def _check_update_worker(self) -> None:
+        latest = fetch_latest_release(self._update_repo)
+        if not latest:
+            self._update_bridge.check_finished.emit(None)
+            return
+        latest_version = latest.get("version", "")
+        if not latest_version or not is_newer_version(latest_version, APP_VERSION):
+            self._update_bridge.check_finished.emit(None)
+            return
+        self._update_bridge.check_finished.emit(latest)
+
+    def _on_update_check_finished(self, latest: dict[str, str] | None) -> None:
+        if not latest:
+            return
+        self._update_latest = latest
+        ask = self.view.ask_yes_no(
+            self._t("update.available_title"),
+            self._t(
+                "update.available_message",
+                current=APP_VERSION,
+                latest=latest.get("version", ""),
+            ),
+        )
+        if ask:
+            self._start_update_download(latest)
+
+    def _start_update_download(self, latest: dict[str, str]) -> None:
+        asset_url = latest.get("asset_url", "")
+        asset_name = latest.get("asset_name", "")
+        if not asset_url or not asset_name:
+            self.view.notify(self._t("notify.failed"), self._t("notify.update_no_exe"), error=True)
+            page_url = latest.get("page_url", "")
+            if page_url:
+                QDesktopServices.openUrl(QUrl(page_url))
+            return
+        self._update_download_cancel.clear()
+        self._update_dialog = QProgressDialog(
+            self._t("update.downloading_text"),
+            self._t("update.downloading_cancel"),
+            0,
+            100,
+            self.view,
+        )
+        self._update_dialog.setWindowTitle(self._t("update.downloading_title"))
+        self._update_dialog.setMinimumWidth(480)
+        self._update_dialog.setValue(0)
+        self._update_dialog.setAutoClose(False)
+        self._update_dialog.setAutoReset(False)
+        self._update_dialog.canceled.connect(self._update_download_cancel.set)
+        self._update_dialog.show()
+        threading.Thread(
+            target=self._download_update_worker,
+            args=(asset_url, asset_name, latest.get("version", ""), latest.get("page_url", "")),
+            daemon=True,
+        ).start()
+
+    def _download_update_worker(self, asset_url: str, asset_name: str, version: str, page_url: str) -> None:
+        try:
+            target = default_download_path(asset_name)
+            path = download_file(asset_url, target, self._update_bridge.download_progress.emit, self._update_download_cancel)
+            self._update_bridge.download_finished.emit(True, str(path), version, page_url)
+        except Exception as exc:
+            self._update_bridge.download_finished.emit(False, str(exc), version, page_url)
+
+    def _on_update_download_progress(self, received: int, total: int) -> None:
+        if self._update_dialog is None:
+            return
+        if total <= 0:
+            self._update_dialog.setRange(0, 0)
+            return
+        self._update_dialog.setRange(0, 100)
+        progress = int(received * 100 / total)
+        self._update_dialog.setValue(max(0, min(progress, 100)))
+
+    def _on_update_download_finished(self, ok: bool, payload: str, version: str, page_url: str) -> None:
+        if self._update_dialog is not None:
+            self._update_dialog.close()
+            self._update_dialog = None
+        if not ok:
+            if payload != "cancelled":
+                self.view.notify(
+                    self._t("notify.failed"),
+                    self._t("notify.update_download_failed", error=payload),
+                    error=True,
+                )
+            return
+        if not is_running_as_exe():
+            self.view.notify(self._t("notify.tip"), self._t("notify.update_manual", version=version))
+            if page_url:
+                QDesktopServices.openUrl(QUrl(page_url))
+            return
+        try:
+            current_exe = current_executable_path()
+            script = create_replace_script(current_exe, Path(payload), os.getpid())
+            launch_replace_script(script)
+            self.view.notify(self._t("notify.success"), self._t("notify.update_installing"))
+            QApplication.quit()
+        except Exception as exc:
+            self.view.notify(
+                self._t("notify.failed"),
+                self._t("notify.update_download_failed", error=exc),
+                error=True,
+            )
 
     def _wire_signals(self) -> None:
         self.view.request_choose_root.connect(self._choose_root)
