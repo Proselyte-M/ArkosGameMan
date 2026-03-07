@@ -296,6 +296,7 @@ class ArkosController:
         self.view.request_import_media.connect(self._import_media)
         self.view.request_language_changed.connect(self._on_language_changed)
         self.view.request_open_emulator_settings.connect(self._open_emulator_settings)
+        self.view.request_run_game_by_row.connect(self._run_game_by_row)
 
     def show(self) -> None:
         self.view.show()
@@ -537,6 +538,14 @@ class ArkosController:
         if action == "run_emulator":
             self._run_game_with_emulator(selected)
 
+    def _run_game_by_row(self, row: int) -> None:
+        game = self._row_game(row)
+        if game is None:
+            return
+        self.selected_game = game
+        self.view.games_table.selectRow(row)
+        self._run_game_with_emulator(game)
+
     def _open_emulator_settings(self) -> None:
         edited = self.view.show_emulator_settings_dialog(self._emulator_configs)
         if edited is None:
@@ -559,10 +568,21 @@ class ArkosController:
         if not rom_abs.exists():
             self.view.notify(self._t("notify.failed"), self._t("notify.file_not_found", path=rom_abs), error=True)
             return
-        if conf.use_bundled and profile.profile_id == "fc":
-            self._run_builtin_fc_emulator(rom_abs)
+        bundled_profiles = {"fc", "snes", "megadrive", "sega8", "segacd32x", "gb", "gba"}
+        if not conf.use_external and profile.profile_id in bundled_profiles:
+            self._run_builtin_libretro(
+                profile.profile_id,
+                rom_abs,
+                conf.key_profile,
+                conf.key_bindings,
+                conf.bundled_core_dll,
+                conf.video_scaling,
+                conf.video_filter,
+                conf.audio_latency_ms,
+                conf.frame_sync,
+            )
             return
-        if conf.use_bundled and profile.profile_id != "fc":
+        if not conf.use_external and profile.profile_id not in bundled_profiles:
             self.view.notify(
                 self._t("notify.tip"),
                 self._t("notify.bundled_profile_not_ready", profile=profile.title),
@@ -597,7 +617,18 @@ class ArkosController:
                 error=True,
             )
 
-    def _run_builtin_fc_emulator(self, rom_abs: Path) -> None:
+    def _run_builtin_libretro(
+        self,
+        profile_id: str,
+        rom_abs: Path,
+        key_profile: str,
+        key_bindings: str,
+        core_override_dll: str,
+        video_scaling: str,
+        video_filter: str,
+        audio_latency_ms: int,
+        frame_sync: str,
+    ) -> None:
         script_candidates = [
             Path(__file__).resolve().parent / "builtin_fc_emulator.py",
             Path(sys.executable).resolve().parent / "builtin_fc_emulator.py",
@@ -606,17 +637,124 @@ class ArkosController:
         if script_path is None:
             self.view.notify(self._t("notify.failed"), self._t("notify.builtin_fc_missing"), error=True)
             return
-        launcher = "python" if getattr(sys, "frozen", False) else sys.executable
+        core_path = self._resolve_bundled_core(profile_id, script_path.parent, core_override_dll)
+        if core_path is None:
+            self.view.notify(
+                self._t("notify.failed"),
+                self._t("notify.builtin_core_missing", profile=profile_id.upper()),
+                error=True,
+            )
+            return
+        launcher = self._resolve_python_launcher()
+        if launcher is None:
+            self.view.notify(self._t("notify.failed"), self._t("notify.python_runtime_missing"), error=True)
+            return
         try:
-            subprocess.Popen([launcher, str(script_path), str(rom_abs)], cwd=script_path.parent)
-            logger.info("启动内置FC模拟器: rom=%s, script=%s", rom_abs, script_path)
+            if isinstance(launcher, str):
+                cmd = [
+                    launcher,
+                    str(script_path),
+                    str(rom_abs),
+                    "--profile",
+                    profile_id,
+                    "--key-profile",
+                    key_profile,
+                    "--key-bindings",
+                    key_bindings,
+                    "--core-path",
+                    str(core_path),
+                    "--video-scaling",
+                    video_scaling,
+                    "--video-filter",
+                    video_filter,
+                    "--audio-latency-ms",
+                    str(max(20, min(300, int(audio_latency_ms)))),
+                    "--frame-sync",
+                    frame_sync,
+                ]
+            else:
+                cmd = [
+                    *launcher,
+                    str(script_path),
+                    str(rom_abs),
+                    "--profile",
+                    profile_id,
+                    "--key-profile",
+                    key_profile,
+                    "--key-bindings",
+                    key_bindings,
+                    "--core-path",
+                    str(core_path),
+                    "--video-scaling",
+                    video_scaling,
+                    "--video-filter",
+                    video_filter,
+                    "--audio-latency-ms",
+                    str(max(20, min(300, int(audio_latency_ms)))),
+                    "--frame-sync",
+                    frame_sync,
+                ]
+            subprocess.Popen(cmd, cwd=script_path.parent)
+            logger.info(
+                "启动内置Libretro模拟器: profile=%s, rom=%s, script=%s, core=%s",
+                profile_id,
+                rom_abs,
+                script_path,
+                core_path,
+            )
         except Exception as exc:
-            logger.exception("启动内置FC模拟器失败: rom=%s", rom_abs)
+            logger.exception("启动内置Libretro模拟器失败: profile=%s, rom=%s", profile_id, rom_abs)
             self.view.notify(
                 self._t("notify.failed"),
                 self._t("notify.emulator_launch_failed", error=exc),
                 error=True,
             )
+
+    @staticmethod
+    def _resolve_bundled_core(profile_id: str, base_dir: Path, core_override_dll: str = "") -> Path | None:
+        core_map = {
+            "fc": "quicknes_libretro.dll",
+            "snes": "snes9x_libretro.dll",
+            "megadrive": "picodrive_libretro.dll",
+            "sega8": "picodrive_libretro.dll",
+            "segacd32x": "picodrive_libretro.dll",
+            "gb": "mgba_libretro.dll",
+            "gba": "mgba_libretro.dll",
+        }
+        override = core_override_dll.strip()
+        if profile_id in {"gb", "gba"} and override.lower() == "vbam_libretro.dll":
+            stable_core = base_dir / "core" / "mgba_libretro.dll"
+            if stable_core.exists():
+                return stable_core
+        if override:
+            override_path = base_dir / "core" / override
+            if override_path.exists():
+                return override_path
+        dll = core_map.get(profile_id)
+        if dll is None:
+            return None
+        core_path = base_dir / "core" / dll
+        return core_path if core_path.exists() else None
+
+    @staticmethod
+    def _resolve_python_launcher() -> str | list[str] | None:
+        if not getattr(sys, "frozen", False):
+            return sys.executable
+        candidates: list[str | list[str]] = [
+            ["py", "-3"],
+            "python",
+            "python3",
+            "pythonw",
+        ]
+        for candidate in candidates:
+            try:
+                probe = [*candidate, "--version"] if isinstance(candidate, list) else [candidate, "--version"]
+                result = subprocess.run(probe, capture_output=True, text=True, shell=False, check=False)
+                if result.returncode == 0:
+                    return candidate
+            except Exception:
+                continue
+        return None
 
     def _reveal_file(self, target_file: Path) -> None:
         if not target_file.exists():

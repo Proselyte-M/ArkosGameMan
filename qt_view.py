@@ -209,6 +209,7 @@ class MainWindow(QMainWindow):
     request_import_media = Signal(str)
     request_language_changed = Signal(str)
     request_open_emulator_settings = Signal()
+    request_run_game_by_row = Signal(int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -465,6 +466,7 @@ class MainWindow(QMainWindow):
         self.toggle_show_preview_image.toggled.connect(self._on_toggle_show_preview_image)
         self.games_table.itemSelectionChanged.connect(self._emit_selected_game_row)
         self.games_table.cellClicked.connect(self._on_table_cell_clicked)
+        self.games_table.cellDoubleClicked.connect(self._emit_run_game_row)
         self.games_table.horizontalHeader().sectionClicked.connect(self.request_header_sort.emit)
         self.games_table.customContextMenuRequested.connect(self._open_games_context_menu)
         self.image_preview.double_clicked.connect(self.request_preview_image_double_click.emit)
@@ -485,6 +487,10 @@ class MainWindow(QMainWindow):
     def _on_table_cell_clicked(self, row: int, column: int) -> None:
         if column == 0:
             self.request_toggle_favorite.emit(row)
+
+    def _emit_run_game_row(self, row: int, _column: int) -> None:
+        if row >= 0:
+            self.request_run_game_by_row.emit(row)
 
     def _on_language_changed(self, index: int) -> None:
         code = self.language_combo.itemData(index)
@@ -778,6 +784,11 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_show_preview_image(self, checked: bool) -> None:
         self._show_image_preview = checked
+        if self._has_video_media:
+            if checked:
+                self.video_player.play()
+            else:
+                self.video_player.pause()
         if self._has_image_media:
             self.image_preview.setVisible(checked)
         else:
@@ -797,7 +808,7 @@ class MainWindow(QMainWindow):
 
     def _update_preview_panel_visibility(self) -> None:
         show_image = self._has_image_media and self._show_image_preview
-        show_video = self._has_video_media
+        show_video = self._has_video_media and self._show_image_preview
         should_show_panel = show_image or show_video
         self.preview_box.setVisible(should_show_panel)
         self.image_preview.setVisible(show_image)
