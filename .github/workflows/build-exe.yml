@@ -1,38 +1,99 @@
-name: Build Windows EXE
+name: Build Windows EXE & Create Release
 
 on:
   push:
     branches:
       - main
       - master
-  workflow_dispatch:
+    tags:  # 新增：监听标签推送事件（标签格式如 v1.0.0）
+      - 'v*'
+  workflow_dispatch:  # 支持手动触发
 
 jobs:
   build-exe:
     runs-on: windows-latest
+    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install build dependencies
         run: |
+          echo "升级 pip 并安装依赖..."
           python -m pip install --upgrade pip
-          pip install pyinstaller pillow PySide6 qtawesome
+          pip install pyinstaller pillow PySide6 qtawesome --verbose
+        shell: pwsh
 
-      - name: Prepare icon
-        run: python scripts/prepare_icon.py --source logo.png --output build
-
-      - name: Build exe
+      - name: Create necessary directories
         run: |
-          pyinstaller --noconfirm --clean --windowed --onefile --name ArkosGameMan --icon build/app_icon.ico --add-data "styles;styles" --add-data "logo.png;." app.py
+          if (-not (Test-Path "build")) { New-Item -ItemType Directory -Path "build" | Out-Null }
+          if (-not (Test-Path "scripts")) { New-Item -ItemType Directory -Path "scripts" | Out-Null }
+        shell: pwsh
 
-      - name: Upload artifact
+      - name: Prepare application icon
+        run: |
+          echo "执行图标处理脚本..."
+          python scripts/prepare_icon.py --source logo.png --output build
+        shell: pwsh
+        # 可选：图标脚本非必须时，取消下面注释
+        # continue-on-error: true
+
+      - name: Build EXE with PyInstaller
+        run: |
+          echo "开始打包 EXE 文件..."
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --windowed `
+            --onefile `
+            --name ArkosGameMan `
+            --icon build/app_icon.ico `
+            --add-data "styles;styles" `
+            --add-data "logo.png;." `
+            --log-level=INFO `
+            app.py
+        shell: pwsh
+
+      - name: Verify EXE file exists
+        run: |
+          if (-not (Test-Path "dist/ArkosGameMan.exe")) {
+            Write-Error "打包失败：未找到 dist/ArkosGameMan.exe 文件"
+            exit 1
+          }
+          Get-ChildItem dist/ArkosGameMan.exe | Format-List
+        shell: pwsh
+
+      - name: Upload EXE as Artifact (for test)
         uses: actions/upload-artifact@v4
         with:
-          name: ArkosGameMan-windows-exe
+          name: ArkosGameMan-windows-exe-${{ github.sha }}
           path: dist/ArkosGameMan.exe
           if-no-files-found: error
+          retention-days: 30
+
+      # 新增：仅当推送标签时，创建 Release 并上传 EXE 到 Release
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')  # 仅标签推送时执行
+        uses: softprops/action-gh-release@v2  # 第三方 Release 工具（稳定且易用）
+        with:
+          # Release 名称：使用标签名（如 v1.0.0）
+          name: ArkosGameMan ${{ github.ref_name }}
+          # Release 描述：可自定义，也可读取 CHANGELOG.md
+          body: |
+            ## ArkosGameMan ${{ github.ref_name }} 发布
+            - 自动构建的 Windows 可执行文件
+            - 构建提交：${{ github.sha }}
+          # 附加 EXE 文件到 Release
+          files: dist/ArkosGameMan.exe
+          # 是否设为预发布（false 为正式发布，true 为预发布）
+          prerelease: false
+        env:
+          # 必须：使用 GitHub 内置令牌授权创建 Release
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
