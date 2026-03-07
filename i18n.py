@@ -520,6 +520,6 @@ def tr(lang: str, key: str, **kwargs) -> str:
     if kwargs:
         try:
             return value.format(**kwargs)
-        except Exception:
+        except (KeyError, IndexError, ValueError):
             return value
     return value

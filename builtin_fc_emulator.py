@@ -415,9 +415,9 @@ class LibretroWindow(QWidget):
             if image.width() > 0 and image.height() > 0:
                 width_ratio = target.width() / image.width()
                 height_ratio = target.height() / image.height()
-                scale = min(width_ratio, height_ratio)
-                draw_w = max(1, int(image.width() * scale))
-                draw_h = max(1, int(image.height() * scale))
+                fit_scale = min(width_ratio, height_ratio)
+                draw_w = max(1, int(image.width() * fit_scale))
+                draw_h = max(1, int(image.height() * fit_scale))
                 x = target.x() + (target.width() - draw_w) // 2
                 y = target.y() + (target.height() - draw_h) // 2
                 target = QRect(x, y, draw_w, draw_h)

@@ -1,0 +1,65 @@
+name: Quality Gate
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install ruff mypy pip-audit pip-licenses
+
+      - name: Compile check
+        run: |
+          python -m compileall app.py arkos_core.py qt_view.py qt_controller.py i18n.py
+
+      - name: Ruff
+        run: |
+          python -m ruff check .
+
+      - name: Mypy
+        run: |
+          python -m mypy .
+
+      - name: Dependency security audit
+        run: |
+          pip-audit -r requirements.lock -f json -o pip-audit.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("pip-audit.json").read_text(encoding="utf-8"))
+          hits = []
+          for dep in data.get("dependencies", []):
+              for vuln in dep.get("vulns", []):
+                  aliases = vuln.get("aliases", [])
+                  severity = vuln.get("severity")
+                  if not isinstance(severity, dict):
+                      continue
+                  score = severity.get("score")
+                  if isinstance(score, (int, float)) and score >= 7:
+                      hits.append((dep.get("name", ""), aliases, score))
+          if hits:
+              for name, aliases, score in hits:
+                  print(f"HIGH RISK: {name} {aliases} score={score}")
+              raise SystemExit(1)
+          print("No CVSS>=7 vulnerabilities found.")
+          PY
+
+      - name: License check
+        run: |
+          pip-licenses --summary

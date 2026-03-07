@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TypeAlias
 
 from PySide6.QtCore import QEasingCurve, Property, QPropertyAnimation, QRectF, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
@@ -44,7 +45,7 @@ from i18n import LANGUAGE_CHOICES, tr
 
 try:
     import qtawesome
-except Exception:
+except ImportError:
     qtawesome = None
 
 
@@ -64,6 +65,41 @@ EDIT_KEYS = [
     "lastplayed",
     "playcount",
 ]
+
+FieldWidget: TypeAlias = QLineEdit | QPlainTextEdit
+FieldLabelWidget: TypeAlias = QLabel | QToolButton
+
+
+class EditFormStore:
+    def __init__(self, widgets: dict[str, FieldWidget]) -> None:
+        self._widgets = widgets
+
+    @staticmethod
+    def _set_field_value(key: str, widget: FieldWidget, value: str) -> None:
+        if key == "desc" and isinstance(widget, QPlainTextEdit):
+            widget.setPlainText(value)
+            return
+        if isinstance(widget, QLineEdit):
+            widget.setText(value)
+
+    @staticmethod
+    def _get_field_value(key: str, widget: FieldWidget) -> str:
+        if key == "desc" and isinstance(widget, QPlainTextEdit):
+            return widget.toPlainText()
+        if isinstance(widget, QLineEdit):
+            return widget.text()
+        return ""
+
+    def clear(self) -> None:
+        for key, widget in self._widgets.items():
+            self._set_field_value(key, widget, "")
+
+    def set_values(self, data: dict[str, str]) -> None:
+        for key, widget in self._widgets.items():
+            self._set_field_value(key, widget, data.get(key, ""))
+
+    def get_values(self) -> dict[str, str]:
+        return {key: self._get_field_value(key, widget) for key, widget in self._widgets.items()}
 
 
 class FadeLabel(QLabel):
@@ -229,7 +265,7 @@ class MainWindow(QMainWindow):
         if qtawesome is not None:
             try:
                 return qtawesome.icon(name, color="#7aa2f7")
-            except Exception:
+            except (KeyError, TypeError, ValueError):
                 pass
         if fallback is not None:
             return fallback
@@ -359,9 +395,10 @@ class MainWindow(QMainWindow):
         form_grid.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         form_grid.setFormAlignment(Qt.AlignmentFlag.AlignTop)
         form_grid.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        self.field_widgets: dict[str, QWidget] = {}
-        self.field_label_widgets: dict[str, QWidget] = {}
+        self.field_widgets: dict[str, FieldWidget] = {}
+        self.field_label_widgets: dict[str, FieldLabelWidget] = {}
         for key in EDIT_KEYS:
+            editor: FieldWidget
             if key == "desc":
                 editor = QPlainTextEdit()
                 editor.setMinimumHeight(120)
@@ -385,6 +422,7 @@ class MainWindow(QMainWindow):
                 label_widget = QLabel(self._t(label_key))
                 self.field_label_widgets[key] = label_widget
                 form_grid.addRow(label_widget, editor)
+        self.edit_form = EditFormStore(self.field_widgets)
         form_scroll.setWidget(form_widget)
         form_layout.addWidget(form_scroll, 1)
         self.btn_save = QPushButton(self._icon("fa5s.check"), self._t("button.save_metadata"))
@@ -596,6 +634,13 @@ class MainWindow(QMainWindow):
 
     def set_games(self, rows: list[tuple[str, str, str, str, str, str]], group_rows: set[int] | None = None) -> None:
         groups = group_rows or set()
+        prev_scroll = self.games_table.verticalScrollBar().value()
+        selected_path = ""
+        current_row = self.games_table.currentRow()
+        if current_row >= 0:
+            current_item = self.games_table.item(current_row, 2)
+            if current_item is not None:
+                selected_path = current_item.text()
         was_sorting = self.games_table.isSortingEnabled()
         if was_sorting:
             self.games_table.setSortingEnabled(False)
@@ -608,8 +653,22 @@ class MainWindow(QMainWindow):
             for c, value in enumerate(row):
                 item = self._build_game_item(value, c, is_group_row)
                 self.games_table.setItem(r, c, item)
-        self.games_table.clearSelection()
-        self.games_table.setCurrentCell(-1, -1)
+            if (r + 1) % 200 == 0:
+                QApplication.processEvents()
+        restored = False
+        if selected_path:
+            for r in range(self.games_table.rowCount()):
+                path_item = self.games_table.item(r, 2)
+                if path_item is None or path_item.text() != selected_path:
+                    continue
+                self.games_table.setCurrentCell(r, 1)
+                self.games_table.selectRow(r)
+                restored = True
+                break
+        if not restored:
+            self.games_table.clearSelection()
+            self.games_table.setCurrentCell(-1, -1)
+        self.games_table.verticalScrollBar().setValue(prev_scroll)
         self.games_table.setUpdatesEnabled(True)
         self.games_table.blockSignals(False)
         if was_sorting:
@@ -643,29 +702,14 @@ class MainWindow(QMainWindow):
         self.games_table.horizontalHeader().setSortIndicator(column, order)
 
     def clear_edit_form(self) -> None:
-        for key, widget in self.field_widgets.items():
-            if key == "desc":
-                widget.setPlainText("")
-            else:
-                widget.setText("")
+        self.edit_form.clear()
         self.clear_preview()
 
     def set_edit_form(self, data: dict[str, str]) -> None:
-        for key, widget in self.field_widgets.items():
-            value = data.get(key, "")
-            if key == "desc":
-                widget.setPlainText(value)
-            else:
-                widget.setText(value)
+        self.edit_form.set_values(data)
 
     def get_edit_form(self) -> dict[str, str]:
-        result: dict[str, str] = {}
-        for key, widget in self.field_widgets.items():
-            if key == "desc":
-                result[key] = widget.toPlainText()
-            else:
-                result[key] = widget.text()
-        return result
+        return self.edit_form.get_values()
 
     def set_busy(self, busy: bool, text: str) -> None:
         self.progress.setVisible(busy)
@@ -674,6 +718,12 @@ class MainWindow(QMainWindow):
         else:
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
+        self.status.showMessage(text)
+
+    def set_task_progress(self, text: str, step: int, total: int) -> None:
+        self.progress.setVisible(True)
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(max(0, min(step, total)))
         self.status.showMessage(text)
 
     def notify(self, title: str, message: str, error: bool = False) -> None:
@@ -821,4 +871,6 @@ class MainWindow(QMainWindow):
         self._preview_panel_visible = should_show_panel
 
     def apply_stylesheet(self, qss: str) -> None:
-        QApplication.instance().setStyleSheet(qss)
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            app.setStyleSheet(qss)

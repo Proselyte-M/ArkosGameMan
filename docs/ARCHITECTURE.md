@@ -8,9 +8,28 @@
 - 控制器层：`qt_controller.py`
   - 负责信号绑定、流程编排、状态同步
   - 将用户动作映射到服务层能力
+- 控制器协作模块：`game_actions.py` / `emulator_runner.py` / `update_service.py`
+  - `game_actions.py` 负责增删改、媒体导入、列表构建等业务动作
+  - `emulator_runner.py` 负责内置/外置模拟器启动与参数组装
+  - `update_service.py` 负责版本检测、下载、替换安装流程
 - 服务层：`arkos_core.py`
   - 负责 ROM 文件操作、`gamelist.xml` 读写、数据校验
   - 对外提供可复用的业务接口
+
+## 模块依赖图
+
+```text
+qt_view.py
+   ↑  signal/slot
+qt_controller.py ──→ game_actions.py
+      │            ├─→ arkos_core.py
+      │            └─→ qt_view.py
+      ├────────────→ emulator_runner.py ──→ emulator_config.py
+      ├────────────→ update_service.py ───→ updater.py
+      └────────────→ i18n.py / version.py
+
+arkos_core.py ──→ xml.etree / pathlib / shutil
+```
 
 ## 关键流程
 
@@ -47,3 +66,29 @@
 - 控制器记录关键动作开始/完成/失败
 - 服务层记录核心写盘行为和耗时
 
+## 异常码表
+
+| 异常码 | 场景 | 触发层 | 用户建议 |
+|---|---|---|---|
+| AG-VAL-001 | 元数据字段格式非法（rating/favorite/日期） | `arkos_core.py` | 按字段格式修正后重试 |
+| AG-PATH-001 | 路径越界访问被拒绝 | `arkos_core.py` | 检查导入路径，确保位于系统目录内 |
+| AG-IO-001 | gamelist 写盘失败 | `arkos_core.py` | 检查磁盘空间与写权限 |
+| AG-ROLLBACK-001 | 删除或重命名失败后触发回滚 | `arkos_core.py` | 重试操作并查看日志定位冲突文件 |
+| AG-EMU-001 | 模拟器启动失败 | `emulator_runner.py` | 校验模拟器路径与启动参数 |
+| AG-UPD-001 | 更新下载失败或取消 | `update_service.py` | 重试下载或手动打开发布页更新 |
+
+## 发布回滚步骤
+
+1. 在 Releases 页面定位上一个稳定版本。
+2. 将该版本重新标记为最新可用发布。
+3. 通知用户使用发布页手动下载稳定包。
+4. 若已发布错误标签，删除错误 Release 与标签后重新发布。
+5. 在 `CHANGELOG` 记录回滚原因和修复计划。
+
+## 配置迁移策略
+
+1. 启动时优先读取 `%APPDATA%/ArkosGameMan/arkosgameman.ini`。
+2. 若新位置不存在，尝试从可执行目录或工作目录复制旧配置。
+3. 复制失败时回退为使用旧配置文件路径继续运行。
+4. 新增配置键必须提供默认值，确保旧配置可无缝启动。
+5. 配置结构变化通过增量迁移实现，避免覆盖用户已有设置。

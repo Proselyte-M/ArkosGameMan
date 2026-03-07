@@ -46,7 +46,7 @@ def fetch_latest_release(repo: str, timeout: float = 8.0) -> dict[str, str] | No
             payload = json.loads(resp.read().decode("utf-8"))
     except URLError:
         return None
-    except Exception:
+    except (OSError, ValueError, UnicodeDecodeError):
         return None
     tag = str(payload.get("tag_name", "")).strip()
     page_url = str(payload.get("html_url", "")).strip()

@@ -8,7 +8,7 @@ from PIL import Image
 
 def make_icon(source: Path, output_dir: Path) -> tuple[Path, Path]:
     image = Image.open(source).convert("RGBA")
-    pixels = image.getdata()
+    pixels = list(image.getdata())
     converted = []
     for r, g, b, a in pixels:
         if a > 0 and r <= 20 and g <= 20 and b <= 20:

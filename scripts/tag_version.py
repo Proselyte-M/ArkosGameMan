@@ -86,6 +86,6 @@ if __name__ == "__main__":
         version = get_version_from_file()
         print(f"🔍 从根目录 version.py 提取到版本号：{version}")
         create_git_tag(version)
-    except Exception as e:
+    except (OSError, ValueError, RuntimeError) as e:
         print(f"❌ 错误：{e}")
         sys.exit(1)

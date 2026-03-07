@@ -6,40 +6,32 @@ import logging
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap
-from PySide6.QtWidgets import QApplication, QProgressDialog
+from PySide6.QtWidgets import QApplication
 
 from arkos_core import ArkosService, GameEntry
+from emulator_runner import EmulatorRunner
 from emulator_config import EmulatorConfigStore
+from game_actions import (
+    ControllerGameActionsMixin,
+    build_table,
+    collect_games_all_systems,
+    game_to_row,
+    should_refresh_after_save,
+)
 from i18n import tr
 from qt_view import MainWindow
-from updater import (
-    create_replace_script,
-    current_executable_path,
-    default_download_path,
-    download_file,
-    fetch_latest_release,
-    is_newer_version,
-    is_running_as_exe,
-    launch_replace_script,
-)
+from update_service import UpdateService
 from version import APP_VERSION
 
 logger = logging.getLogger(__name__)
 
 
-class UpdateBridge(QObject):
-    check_finished = Signal(object)
-    download_progress = Signal(int, int)
-    download_finished = Signal(bool, str, str, str)
-
-
-class ArkosController:
+class ArkosController(ControllerGameActionsMixin):
     def __init__(self) -> None:
         self.view = MainWindow()
         self._settings_file = self._resolve_settings_file()
@@ -57,24 +49,37 @@ class ArkosController:
         self._emulator_store = EmulatorConfigStore(self._settings_file)
         self._update_repo = self._load_update_repo()
         self._update_check_enabled = self._load_update_enabled()
-        self._update_check_started = False
         self._emulator_configs = self._emulator_store.load()
-        self._update_download_cancel = threading.Event()
-        self._update_dialog: QProgressDialog | None = None
-        self._update_latest: dict[str, str] | None = None
-        self._update_bridge = UpdateBridge(self.view)
-        self._update_bridge.check_finished.connect(self._on_update_check_finished)
-        self._update_bridge.download_progress.connect(self._on_update_download_progress)
-        self._update_bridge.download_finished.connect(self._on_update_download_finished)
+        self._search_debounce = QTimer(self.view)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(180)
+        self._search_debounce.timeout.connect(self._refresh_game_table)
         self._theme_anim = QPropertyAnimation(self.view, b"windowOpacity", self.view)
         self._theme_anim.setDuration(180)
         self._theme_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._update_service = UpdateService(
+            parent_view=self.view,
+            app_version=APP_VERSION,
+            tr=self._t,
+            notify=lambda title, message, error: self.view.notify(title, message, error=error),
+            ask_yes_no=self.view.ask_yes_no,
+        )
+        self._update_service.configure(self._update_repo, self._update_check_enabled)
+        self._emulator_runner = EmulatorRunner(
+            notify=lambda title, message, error: self.view.notify(title, message, error=error),
+            tr=self._t,
+            resolve_game_system=self._game_system,
+            rel_to_abs=self.service.repo.rel_to_abs,
+            current_system_getter=lambda: self.service.current_system,
+            store=self._emulator_store,
+            get_configs=lambda: self._emulator_configs,
+        )
         self.view.set_root_path(str(initial_root))
         self.view.set_language(self.current_language)
         self._wire_signals()
         self._apply_theme(self.current_theme, animate=False)
         self._refresh_systems()
-        if self._update_check_enabled:
+        if self._update_service.should_check_on_start():
             QTimer.singleShot(2000, self._start_update_check)
 
     def _load_last_root(self) -> Path:
@@ -109,7 +114,7 @@ class ArkosController:
                 settings_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(legacy, settings_file)
                 return settings_file
-            except Exception:
+            except OSError:
                 return legacy
         return settings_file
 
@@ -147,7 +152,7 @@ class ArkosController:
         try:
             parser.read(git_cfg, encoding="utf-8")
             origin = parser.get('remote "origin"', "url", fallback="").strip()
-        except Exception:
+        except (configparser.Error, OSError):
             return ""
         if not origin:
             return ""
@@ -165,117 +170,7 @@ class ArkosController:
         return repo
 
     def _start_update_check(self) -> None:
-        if self._update_check_started:
-            return
-        if not self._update_repo:
-            logger.info("跳过更新检查: 未配置GitHub仓库")
-            return
-        self._update_check_started = True
-        threading.Thread(target=self._check_update_worker, daemon=True).start()
-
-    def _check_update_worker(self) -> None:
-        latest = fetch_latest_release(self._update_repo)
-        if not latest:
-            self._update_bridge.check_finished.emit(None)
-            return
-        latest_version = latest.get("version", "")
-        if not latest_version or not is_newer_version(latest_version, APP_VERSION):
-            self._update_bridge.check_finished.emit(None)
-            return
-        self._update_bridge.check_finished.emit(latest)
-
-    def _on_update_check_finished(self, latest: dict[str, str] | None) -> None:
-        if not latest:
-            return
-        self._update_latest = latest
-        ask = self.view.ask_yes_no(
-            self._t("update.available_title"),
-            self._t(
-                "update.available_message",
-                current=APP_VERSION,
-                latest=latest.get("version", ""),
-            ),
-        )
-        if ask:
-            self._start_update_download(latest)
-
-    def _start_update_download(self, latest: dict[str, str]) -> None:
-        asset_url = latest.get("asset_url", "")
-        asset_name = latest.get("asset_name", "")
-        if not asset_url or not asset_name:
-            self.view.notify(self._t("notify.failed"), self._t("notify.update_no_exe"), error=True)
-            page_url = latest.get("page_url", "")
-            if page_url:
-                QDesktopServices.openUrl(QUrl(page_url))
-            return
-        self._update_download_cancel.clear()
-        self._update_dialog = QProgressDialog(
-            self._t("update.downloading_text"),
-            self._t("update.downloading_cancel"),
-            0,
-            100,
-            self.view,
-        )
-        self._update_dialog.setWindowTitle(self._t("update.downloading_title"))
-        self._update_dialog.setMinimumWidth(480)
-        self._update_dialog.setValue(0)
-        self._update_dialog.setAutoClose(False)
-        self._update_dialog.setAutoReset(False)
-        self._update_dialog.canceled.connect(self._update_download_cancel.set)
-        self._update_dialog.show()
-        threading.Thread(
-            target=self._download_update_worker,
-            args=(asset_url, asset_name, latest.get("version", ""), latest.get("page_url", "")),
-            daemon=True,
-        ).start()
-
-    def _download_update_worker(self, asset_url: str, asset_name: str, version: str, page_url: str) -> None:
-        try:
-            target = default_download_path(asset_name)
-            path = download_file(asset_url, target, self._update_bridge.download_progress.emit, self._update_download_cancel)
-            self._update_bridge.download_finished.emit(True, str(path), version, page_url)
-        except Exception as exc:
-            self._update_bridge.download_finished.emit(False, str(exc), version, page_url)
-
-    def _on_update_download_progress(self, received: int, total: int) -> None:
-        if self._update_dialog is None:
-            return
-        if total <= 0:
-            self._update_dialog.setRange(0, 0)
-            return
-        self._update_dialog.setRange(0, 100)
-        progress = int(received * 100 / total)
-        self._update_dialog.setValue(max(0, min(progress, 100)))
-
-    def _on_update_download_finished(self, ok: bool, payload: str, version: str, page_url: str) -> None:
-        if self._update_dialog is not None:
-            self._update_dialog.close()
-            self._update_dialog = None
-        if not ok:
-            if payload != "cancelled":
-                self.view.notify(
-                    self._t("notify.failed"),
-                    self._t("notify.update_download_failed", error=payload),
-                    error=True,
-                )
-            return
-        if not is_running_as_exe():
-            self.view.notify(self._t("notify.tip"), self._t("notify.update_manual", version=version))
-            if page_url:
-                QDesktopServices.openUrl(QUrl(page_url))
-            return
-        try:
-            current_exe = current_executable_path()
-            script = create_replace_script(current_exe, Path(payload), os.getpid())
-            launch_replace_script(script)
-            self.view.notify(self._t("notify.success"), self._t("notify.update_installing"))
-            QApplication.quit()
-        except Exception as exc:
-            self.view.notify(
-                self._t("notify.failed"),
-                self._t("notify.update_download_failed", error=exc),
-                error=True,
-            )
+        self._update_service.start_check()
 
     def _wire_signals(self) -> None:
         self.view.request_choose_root.connect(self._choose_root)
@@ -287,7 +182,7 @@ class ArkosController:
         self.view.request_save_metadata.connect(self._save_metadata)
         self.view.request_toggle_theme.connect(self._toggle_theme)
         self.view.request_system_changed.connect(self._on_system_changed)
-        self.view.request_search_or_sort.connect(lambda _text: self._refresh_game_table())
+        self.view.request_search_or_sort.connect(self._schedule_refresh)
         self.view.request_game_selected.connect(self._on_game_selected)
         self.view.request_header_sort.connect(self._on_header_sort)
         self.view.request_context_action.connect(self._on_context_action)
@@ -297,6 +192,9 @@ class ArkosController:
         self.view.request_language_changed.connect(self._on_language_changed)
         self.view.request_open_emulator_settings.connect(self._open_emulator_settings)
         self.view.request_run_game_by_row.connect(self._run_game_by_row)
+
+    def _schedule_refresh(self, *_args) -> None:
+        self._search_debounce.start()
 
     def show(self) -> None:
         self.view.show()
@@ -316,8 +214,10 @@ class ArkosController:
         self.view.set_busy(True, self._t("status.refreshing_systems"))
         try:
             root_path = Path(self.view.get_root_path().strip())
+            self.view.set_task_progress(self._t("status.refreshing_systems"), 1, 3)
             self.service.set_root(root_path)
             self._save_last_root(root_path)
+            self.view.set_task_progress(self._t("status.refreshing_systems"), 2, 3)
             systems = self.service.list_systems()
             self._systems = systems[:]
             self.view.set_systems([self._t("system.all_games"), self._t("system.favorites"), *systems])
@@ -327,9 +227,10 @@ class ArkosController:
             self._mode = "all"
             self.view.set_games([], set())
             self.view.clear_edit_form()
+            self.view.set_task_progress(self._t("status.systems_refreshed"), 3, 3)
             self.view.set_busy(False, self._t("status.systems_refreshed"))
             logger.info("系统刷新完成: root=%s, 系统数=%d, 耗时=%.3fs", root_path, len(systems), time.perf_counter() - start)
-        except Exception as exc:
+        except (OSError, ValueError, configparser.Error) as exc:
             self.view.set_busy(False, self._t("status.refresh_failed"))
             logger.exception("系统刷新失败: root=%s", self.view.get_root_path().strip())
             self.view.notify(self._t("notify.failed"), self._t("notify.refresh_system_failed", error=exc), error=True)
@@ -341,14 +242,23 @@ class ArkosController:
         logger.info("切换系统: %s", system)
         self.view.set_busy(True, self._t("status.loading_games"))
         try:
+            self.view.set_task_progress(self._t("status.loading_games"), 1, 3)
             if system == self._t("system.all_games"):
                 self._mode = "all"
                 self.service.current_system = ""
-                self.service.games = self._collect_games_all_systems(favorites_only=False)
+                self.service.games = collect_games_all_systems(
+                    systems=self._systems,
+                    load_games=self.service.repo.load_games,
+                    favorites_only=False,
+                )
             elif system == self._t("system.favorites"):
                 self._mode = "favorites"
                 self.service.current_system = ""
-                self.service.games = self._collect_games_all_systems(favorites_only=True)
+                self.service.games = collect_games_all_systems(
+                    systems=self._systems,
+                    load_games=self.service.repo.load_games,
+                    favorites_only=True,
+                )
             else:
                 self._mode = "system"
                 self.service.select_system(system)
@@ -356,138 +266,52 @@ class ArkosController:
             self._header_sort_column = None
             self._header_sort_asc = True
             self.view.clear_edit_form()
+            self.view.set_task_progress(self._t("status.loading_games"), 2, 3)
             self._refresh_game_table()
+            self.view.set_task_progress(f"{system} {self._t('status.ready')}", 3, 3)
             self.view.set_busy(False, f"{system} {self._t('status.ready')}")
             logger.info("系统加载完成: %s, 模式=%s, 耗时=%.3fs", system, self._mode, time.perf_counter() - start)
-        except Exception as exc:
+        except (OSError, ValueError, FileNotFoundError) as exc:
             self.view.set_busy(False, self._t("status.load_failed"))
             logger.exception("系统加载失败: %s", system)
             self.view.notify(self._t("notify.failed"), self._t("notify.load_system_failed", error=exc), error=True)
 
-    def _collect_games_all_systems(self, favorites_only: bool) -> list[GameEntry]:
-        all_games: list[GameEntry] = []
-        for system in self._systems:
-            for game in self.service.repo.load_games(system):
-                if favorites_only and game.get("favorite", "false").lower() != "true":
-                    continue
-                game.fields["__system__"] = system
-                all_games.append(game)
-        return all_games
-
-    @staticmethod
-    def _display_name(game: GameEntry, mode: str) -> str:
-        name = game.get("name", game.rom_name)
-        if mode in {"all", "favorites"}:
-            return f"[{game.get('__system__', '')}] {name}"
-        return name
-
-    @staticmethod
-    def _display_path(game: GameEntry, mode: str) -> str:
-        if mode in {"all", "favorites"}:
-            return f"{game.get('__system__', '')}:{game.path}"
-        return game.path
-
     def _refresh_game_table(self, *_args) -> None:
         start = time.perf_counter()
         if self._mode == "all":
-            self.service.games = self._collect_games_all_systems(favorites_only=False)
+            self.service.games = collect_games_all_systems(
+                systems=self._systems,
+                load_games=self.service.repo.load_games,
+                favorites_only=False,
+            )
         elif self._mode == "favorites":
-            self.service.games = self._collect_games_all_systems(favorites_only=True)
-        source_games = self.service.games[:]
-        query = self.view.search_edit.text().strip().lower()
-        if query:
-            source_games = [
-                g
-                for g in source_games
-                if query in g.get("name", "").lower()
-                or query in g.path.lower()
-                or query in g.get("__system__", "").lower()
-            ]
-        self.filtered_games = self._sort_games(source_games)
-        rows: list[tuple[str, str, str, str, str, str]] = []
-        self.display_games = []
-        group_rows: set[int] = set()
-        if self._mode == "favorites":
-            grouped: dict[str, list[GameEntry]] = {}
-            for game in self.filtered_games:
-                grouped.setdefault(game.get("__system__", ""), []).append(game)
-            for system in sorted(grouped.keys(), key=str.lower):
-                row_idx = len(rows)
-                rows.append(("", self._t("group.system_header", system=system), "", "", "", ""))
-                self.display_games.append(None)
-                group_rows.add(row_idx)
-                for game in grouped[system]:
-                    rows.append(self._game_to_row(game))
-                    self.display_games.append(game)
-        else:
-            for game in self.filtered_games:
-                rows.append(self._game_to_row(game))
-                self.display_games.append(game)
-        self.view.set_games(rows, group_rows)
+            self.service.games = collect_games_all_systems(
+                systems=self._systems,
+                load_games=self.service.repo.load_games,
+                favorites_only=True,
+            )
+        table = build_table(
+            mode=self._mode,
+            source_games=self.service.games,
+            query_text=self.view.search_edit.text(),
+            header_sort_column=self._header_sort_column,
+            header_sort_asc=self._header_sort_asc,
+            group_system_header=lambda system: self._t("group.system_header", system=system),
+        )
+        self.filtered_games = table.filtered_games
+        self.display_games = table.display_games
+        self.view.set_games(table.rows, table.group_rows)
+        if self._header_sort_column is not None:
+            self.view.set_header_sort_indicator(self._header_sort_column, self._header_sort_asc)
         logger.info(
             "刷新游戏表: 模式=%s, 查询='%s', 数据=%d, 展示=%d, 分组头=%d, 耗时=%.3fs",
             self._mode,
-            query,
+            table.query,
             len(self.service.games),
-            len(rows),
-            len(group_rows),
+            len(table.rows),
+            len(table.group_rows),
             time.perf_counter() - start,
         )
-
-    def _sort_games(self, data: list[GameEntry]) -> list[GameEntry]:
-        sorted_games = data[:]
-        if self._header_sort_column is None:
-            sorted_games.sort(key=lambda g: self._display_name(g, self._mode).lower())
-            return sorted_games
-        key_fn = self._column_sort_key(self._header_sort_column)
-        if key_fn is None:
-            return sorted_games
-        sorted_games = sorted(sorted_games, key=key_fn, reverse=not self._header_sort_asc)
-        self.view.set_header_sort_indicator(self._header_sort_column, self._header_sort_asc)
-        return sorted_games
-
-    @staticmethod
-    def _favorite_text(game: GameEntry) -> str:
-        return "♥" if game.get("favorite", "false").lower() == "true" else "♡"
-
-    def _game_to_row(self, game: GameEntry) -> tuple[str, str, str, str, str, str]:
-        return (
-            self._favorite_text(game),
-            self._display_name(game, self._mode),
-            self._display_path(game, self._mode),
-            game.get("playcount", "0"),
-            game.get("rating", ""),
-            game.get("lastplayed", ""),
-        )
-
-    def _column_sort_key(self, column: int):
-        if column == 0:
-            return lambda g: g.get("favorite", "false").lower() == "true"
-        if column == 1:
-            return lambda g: self._display_name(g, self._mode).lower()
-        if column == 2:
-            return lambda g: self._display_path(g, self._mode).lower()
-        if column == 3:
-            return lambda g: self._safe_int(g.get("playcount", "0"))
-        if column == 4:
-            return lambda g: self._safe_float(g.get("rating", "0"))
-        if column == 5:
-            return lambda g: g.get("lastplayed", "")
-        return None
-
-    @staticmethod
-    def _safe_int(value: str) -> int:
-        try:
-            return int(value or 0)
-        except Exception:
-            return 0
-
-    @staticmethod
-    def _safe_float(value: str) -> float:
-        try:
-            return float(value or 0)
-        except Exception:
-            return 0.0
 
     def _on_header_sort(self, column: int) -> None:
         if self._header_sort_column == column:
@@ -555,206 +379,7 @@ class ArkosController:
         self.view.notify(self._t("notify.success"), self._t("notify.emulator_settings_saved"))
 
     def _run_game_with_emulator(self, game: GameEntry) -> None:
-        system = self._game_system(game) or self.service.current_system
-        if not system:
-            self.view.notify(self._t("notify.tip"), self._t("notify.select_system_game_first"), error=True)
-            return
-        resolved = self._emulator_store.resolve_profile(system, self._emulator_configs)
-        if resolved is None:
-            self.view.notify(self._t("notify.tip"), self._t("notify.emulator_config_missing", system=system), error=True)
-            return
-        profile, conf = resolved
-        rom_abs = self.service.repo.rel_to_abs(system, game.path)
-        if not rom_abs.exists():
-            self.view.notify(self._t("notify.failed"), self._t("notify.file_not_found", path=rom_abs), error=True)
-            return
-        bundled_profiles = {"fc", "snes", "megadrive", "sega8", "segacd32x", "gb", "gba"}
-        if not conf.use_external and profile.profile_id in bundled_profiles:
-            self._run_builtin_libretro(
-                profile.profile_id,
-                rom_abs,
-                conf.key_profile,
-                conf.key_bindings,
-                conf.bundled_core_dll,
-                conf.video_scaling,
-                conf.video_filter,
-                conf.audio_latency_ms,
-                conf.frame_sync,
-            )
-            return
-        if not conf.use_external and profile.profile_id not in bundled_profiles:
-            self.view.notify(
-                self._t("notify.tip"),
-                self._t("notify.bundled_profile_not_ready", profile=profile.title),
-                error=True,
-            )
-            return
-        emulator_path = conf.emulator_path.strip()
-        launch_command = conf.launch_command.strip() or '{emulator} "{rom}"'
-        if not emulator_path:
-            self.view.notify(
-                self._t("notify.tip"),
-                self._t("notify.emulator_path_missing", profile=profile.title, system=system),
-                error=True,
-            )
-            return
-        try:
-            cmd_text = launch_command.format(
-                emulator=emulator_path,
-                rom=str(rom_abs),
-                system=system,
-                profile=profile.profile_id,
-                core=profile.recommended_cores[0] if profile.recommended_cores else "",
-            )
-            emulator_dir = Path(emulator_path).parent if Path(emulator_path).parent.exists() else None
-            subprocess.Popen(cmd_text, cwd=emulator_dir, shell=True)
-            logger.info("通过模拟器启动游戏: profile=%s, system=%s, rom=%s", profile.profile_id, system, rom_abs)
-        except Exception as exc:
-            logger.exception("模拟器启动失败: system=%s, rom=%s", system, rom_abs)
-            self.view.notify(
-                self._t("notify.failed"),
-                self._t("notify.emulator_launch_failed", error=exc),
-                error=True,
-            )
-
-    def _run_builtin_libretro(
-        self,
-        profile_id: str,
-        rom_abs: Path,
-        key_profile: str,
-        key_bindings: str,
-        core_override_dll: str,
-        video_scaling: str,
-        video_filter: str,
-        audio_latency_ms: int,
-        frame_sync: str,
-    ) -> None:
-        script_candidates = [
-            Path(__file__).resolve().parent / "builtin_fc_emulator.py",
-            Path(sys.executable).resolve().parent / "builtin_fc_emulator.py",
-        ]
-        script_path = next((path for path in script_candidates if path.exists()), None)
-        if script_path is None:
-            self.view.notify(self._t("notify.failed"), self._t("notify.builtin_fc_missing"), error=True)
-            return
-        core_path = self._resolve_bundled_core(profile_id, script_path.parent, core_override_dll)
-        if core_path is None:
-            self.view.notify(
-                self._t("notify.failed"),
-                self._t("notify.builtin_core_missing", profile=profile_id.upper()),
-                error=True,
-            )
-            return
-        launcher = self._resolve_python_launcher()
-        if launcher is None:
-            self.view.notify(self._t("notify.failed"), self._t("notify.python_runtime_missing"), error=True)
-            return
-        try:
-            if isinstance(launcher, str):
-                cmd = [
-                    launcher,
-                    str(script_path),
-                    str(rom_abs),
-                    "--profile",
-                    profile_id,
-                    "--key-profile",
-                    key_profile,
-                    "--key-bindings",
-                    key_bindings,
-                    "--core-path",
-                    str(core_path),
-                    "--video-scaling",
-                    video_scaling,
-                    "--video-filter",
-                    video_filter,
-                    "--audio-latency-ms",
-                    str(max(20, min(300, int(audio_latency_ms)))),
-                    "--frame-sync",
-                    frame_sync,
-                ]
-            else:
-                cmd = [
-                    *launcher,
-                    str(script_path),
-                    str(rom_abs),
-                    "--profile",
-                    profile_id,
-                    "--key-profile",
-                    key_profile,
-                    "--key-bindings",
-                    key_bindings,
-                    "--core-path",
-                    str(core_path),
-                    "--video-scaling",
-                    video_scaling,
-                    "--video-filter",
-                    video_filter,
-                    "--audio-latency-ms",
-                    str(max(20, min(300, int(audio_latency_ms)))),
-                    "--frame-sync",
-                    frame_sync,
-                ]
-            subprocess.Popen(cmd, cwd=script_path.parent)
-            logger.info(
-                "启动内置Libretro模拟器: profile=%s, rom=%s, script=%s, core=%s",
-                profile_id,
-                rom_abs,
-                script_path,
-                core_path,
-            )
-        except Exception as exc:
-            logger.exception("启动内置Libretro模拟器失败: profile=%s, rom=%s", profile_id, rom_abs)
-            self.view.notify(
-                self._t("notify.failed"),
-                self._t("notify.emulator_launch_failed", error=exc),
-                error=True,
-            )
-
-    @staticmethod
-    def _resolve_bundled_core(profile_id: str, base_dir: Path, core_override_dll: str = "") -> Path | None:
-        core_map = {
-            "fc": "quicknes_libretro.dll",
-            "snes": "snes9x_libretro.dll",
-            "megadrive": "picodrive_libretro.dll",
-            "sega8": "picodrive_libretro.dll",
-            "segacd32x": "picodrive_libretro.dll",
-            "gb": "mgba_libretro.dll",
-            "gba": "mgba_libretro.dll",
-        }
-        override = core_override_dll.strip()
-        if profile_id in {"gb", "gba"} and override.lower() == "vbam_libretro.dll":
-            stable_core = base_dir / "core" / "mgba_libretro.dll"
-            if stable_core.exists():
-                return stable_core
-        if override:
-            override_path = base_dir / "core" / override
-            if override_path.exists():
-                return override_path
-        dll = core_map.get(profile_id)
-        if dll is None:
-            return None
-        core_path = base_dir / "core" / dll
-        return core_path if core_path.exists() else None
-
-    @staticmethod
-    def _resolve_python_launcher() -> str | list[str] | None:
-        if not getattr(sys, "frozen", False):
-            return sys.executable
-        candidates: list[str | list[str]] = [
-            ["py", "-3"],
-            "python",
-            "python3",
-            "pythonw",
-        ]
-        for candidate in candidates:
-            try:
-                probe = [*candidate, "--version"] if isinstance(candidate, list) else [candidate, "--version"]
-                result = subprocess.run(probe, capture_output=True, text=True, shell=False, check=False)
-                if result.returncode == 0:
-                    return candidate
-            except Exception:
-                continue
-        return None
+        self._emulator_runner.run_game(game)
 
     def _reveal_file(self, target_file: Path) -> None:
         if not target_file.exists():
@@ -766,7 +391,7 @@ class ArkosController:
     def _open_in_explorer_select(target_file: Path) -> None:
         try:
             subprocess.Popen(["explorer", f"/select,{str(target_file)}"])
-        except Exception:
+        except OSError:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(target_file)))
 
     def _row_game(self, row: int) -> GameEntry | None:
@@ -793,20 +418,6 @@ class ArkosController:
                 return idx
         return -1
 
-    def _should_refresh_after_save(
-        self,
-        query: str,
-        before_row: tuple[str, str, str, str, str, str],
-        after_row: tuple[str, str, str, str, str, str],
-    ) -> bool:
-        if self._mode in {"all", "favorites"}:
-            return True
-        if query:
-            return True
-        if self._header_sort_column is None:
-            return before_row[1] != after_row[1]
-        return before_row[self._header_sort_column] != after_row[self._header_sort_column]
-
     def _toggle_favorite_by_row(self, row: int) -> None:
         game = self._row_game(row)
         if game is None:
@@ -823,7 +434,7 @@ class ArkosController:
             if self.selected_game is game:
                 self.selected_game.set("favorite", data["favorite"])
             self._refresh_game_table()
-        except Exception as exc:
+        except (OSError, ValueError, FileNotFoundError) as exc:
             self.view.notify(self._t("notify.failed"), self._t("notify.favorite_failed", error=exc), error=True)
 
     def _add_favorite(self) -> None:
@@ -884,13 +495,19 @@ class ArkosController:
         try:
             start = time.perf_counter()
             self.view.set_busy(True, self._t("status.saving_metadata"))
-            before_row = self._game_to_row(self.selected_game)
+            before_row = game_to_row(self.selected_game, self._mode)
             query = self.view.search_edit.text().strip().lower()
             self.service.current_system = game_system
             changed = self.service.save_metadata(self.selected_game, data)
             if changed:
-                after_row = self._game_to_row(self.selected_game)
-                need_refresh = self._should_refresh_after_save(query, before_row, after_row)
+                after_row = game_to_row(self.selected_game, self._mode)
+                need_refresh = should_refresh_after_save(
+                    mode=self._mode,
+                    query=query,
+                    before_row=before_row,
+                    after_row=after_row,
+                    header_sort_column=self._header_sort_column,
+                )
                 if need_refresh:
                     self._refresh_game_table()
                     self._select_game_by_path(self.selected_game.path)
@@ -910,159 +527,10 @@ class ArkosController:
                 changed,
                 time.perf_counter() - start,
             )
-        except Exception as exc:
+        except (OSError, ValueError, FileNotFoundError) as exc:
             self.view.set_busy(False, self._t("status.metadata_save_failed"))
             logger.exception("保存元数据失败: system=%s, game=%s", game_system, self.selected_game.path)
             self.view.notify(self._t("notify.validation_failed"), str(exc), error=True)
-
-    def _add_rom(self) -> None:
-        if not self.service.current_system:
-            self.view.notify(self._t("notify.tip"), self._t("notify.select_system_first"), error=True)
-            return
-        file_name = self.view.choose_file(self._t("dialog.select_rom_file"))
-        if not file_name:
-            return
-        self.view.set_busy(True, self._t("status.adding_rom"))
-        try:
-            start = time.perf_counter()
-            source = Path(file_name)
-            self.service.add_rom(source)
-            if self.view.search_edit.text():
-                self.view.search_edit.clear()
-            self._refresh_game_table()
-            self._select_game_by_path(self.service.repo.normalize_rel_path(source.name))
-            self.view.set_busy(False, self._t("status.add_rom_done"))
-            self.view.notify(self._t("notify.success"), self._t("notify.rom_added"))
-            logger.info(
-                "添加ROM完成: system=%s, source=%s, 耗时=%.3fs",
-                self.service.current_system,
-                source,
-                time.perf_counter() - start,
-            )
-        except Exception as exc:
-            self.view.set_busy(False, self._t("status.add_rom_failed"))
-            logger.exception("添加ROM失败: system=%s, source=%s", self.service.current_system, file_name)
-            self.view.notify(self._t("notify.failed"), self._t("notify.add_rom_failed", error=exc), error=True)
-
-    def _delete_game(self) -> None:
-        if self.selected_game is None:
-            self.view.notify(self._t("notify.tip"), self._t("notify.select_game_first"), error=True)
-            return
-        game_system = self._game_system(self.selected_game) or self.service.current_system
-        if not game_system:
-            self.view.notify(self._t("notify.tip"), self._t("notify.select_game_first"), error=True)
-            return
-        display_name = self.selected_game.get("name", self.selected_game.rom_name)
-        if not self.view.ask_yes_no(self._t("dialog.delete_confirm_title"), self._t("dialog.delete_confirm", name=display_name)):
-            return
-        full_delete = self.view.ask_yes_no(self._t("dialog.delete_mode_title"), self._t("dialog.delete_mode"))
-        self.view.set_busy(True, self._t("status.deleting"))
-        try:
-            self.service.current_system = game_system
-            self.service.delete_game(self.selected_game, full_delete)
-            self.selected_game = None
-            self._refresh_game_table()
-            self.view.clear_edit_form()
-            self.view.set_busy(False, self._t("status.delete_done"))
-            self.view.notify(self._t("notify.success"), self._t("notify.delete_success"))
-        except Exception as exc:
-            self.view.set_busy(False, self._t("status.delete_failed"))
-            self.view.notify(self._t("notify.failed"), self._t("notify.delete_failed_rollback", error=exc), error=True)
-
-    def _rename_game(self) -> None:
-        if self.selected_game is None:
-            self.view.notify(self._t("notify.tip"), self._t("notify.select_game_first"), error=True)
-            return
-        game_system = self._game_system(self.selected_game) or self.service.current_system
-        if not game_system:
-            self.view.notify(self._t("notify.tip"), self._t("notify.select_game_first"), error=True)
-            return
-        old_stem = Path(self.selected_game.path).stem
-        new_stem = self.view.ask_text(self._t("dialog.rename_title"), self._t("dialog.rename_label"), old_stem).strip()
-        if not new_stem:
-            return
-        self.view.set_busy(True, self._t("status.renaming"))
-        try:
-            self.service.current_system = game_system
-            self.service.rename_game(self.selected_game, new_stem)
-            self._refresh_game_table()
-            self.view.set_busy(False, self._t("status.rename_done"))
-            self.view.notify(self._t("notify.success"), self._t("notify.rename_success"))
-        except Exception as exc:
-            self.view.set_busy(False, self._t("status.rename_failed"))
-            self.view.notify(self._t("notify.failed"), self._t("notify.rename_failed_rollback", error=exc), error=True)
-
-    def _backup_saves(self) -> None:
-        self.view.set_busy(True, self._t("status.backing_up_saves"))
-        try:
-            zip_file = self.service.backup_saves()
-            self.view.set_busy(False, self._t("status.backup_done"))
-            self.view.notify(self._t("notify.success"), self._t("notify.backup_success", path=zip_file))
-        except Exception as exc:
-            self.view.set_busy(False, self._t("status.backup_failed"))
-            self.view.notify(self._t("notify.failed"), self._t("notify.backup_failed", error=exc), error=True)
-
-    def _import_media(self, media_key: str) -> None:
-        if self.selected_game is None:
-            self.view.notify(self._t("notify.tip"), self._t("notify.select_game_first"), error=True)
-            return
-        game_system = self._game_system(self.selected_game) or self.service.current_system
-        if not game_system:
-            self.view.notify(self._t("notify.tip"), self._t("notify.select_game_first"), error=True)
-            return
-        filters = {
-            "image": "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
-            "thumbnail": "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
-            "video": "Video Files (*.mp4 *.mkv *.avi *.mov *.webm)",
-        }
-        titles = {
-            "image": self._t("dialog.select_image"),
-            "thumbnail": self._t("dialog.select_image"),
-            "video": self._t("dialog.select_video"),
-        }
-        folder_map = {"image": "covers", "thumbnail": "thumbnails", "video": "videos"}
-        if media_key not in folder_map:
-            return
-        file_name = self.view.choose_file(titles[media_key], filters[media_key])
-        if not file_name:
-            return
-        self.view.set_busy(True, self._t("status.media_importing"))
-        try:
-            start = time.perf_counter()
-            source = Path(file_name)
-            folder = folder_map[media_key]
-            ext = source.suffix.lower()
-            if not ext:
-                raise ValueError("文件扩展名无效")
-            rom_stem = Path(self.selected_game.path).stem
-            target_dir = self.service.repo.system_dir(game_system) / "media" / folder
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target_name = f"{rom_stem}{ext}"
-            target = target_dir / target_name
-            shutil.copy2(source, target)
-            rel = f"./media/{folder}/{target_name}".replace("\\", "/")
-            data = {k: self.selected_game.get(k, "") for k in self.view.field_widgets}
-            data[media_key] = rel
-            self.service.current_system = game_system
-            self.service.save_metadata(self.selected_game, data)
-            self._refresh_game_table()
-            values = {k: self.selected_game.get(k, "") for k in self.view.field_widgets}
-            self.view.set_edit_form(values)
-            self._refresh_preview(self.selected_game)
-            self.view.set_busy(False, self._t("status.media_import_done"))
-            self.view.notify(self._t("notify.success"), self._t("notify.media_import_success", label=self._t(f"label.{media_key}")))
-            logger.info(
-                "导入媒体完成: system=%s, game=%s, type=%s, source=%s, 耗时=%.3fs",
-                game_system,
-                self.selected_game.path,
-                media_key,
-                source,
-                time.perf_counter() - start,
-            )
-        except Exception as exc:
-            self.view.set_busy(False, self._t("status.media_import_failed"))
-            logger.exception("导入媒体失败: system=%s, type=%s, source=%s", game_system, media_key, file_name)
-            self.view.notify(self._t("notify.failed"), self._t("notify.media_import_failed", error=exc), error=True)
 
     def _on_language_changed(self, lang: str) -> None:
         self.current_language = lang
@@ -1103,6 +571,7 @@ def run_app() -> int:
     if app is None:
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
         app = QApplication([])
+    assert isinstance(app, QApplication)
     icon = _load_app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)
@@ -1111,7 +580,6 @@ def run_app() -> int:
         controller.view.setWindowIcon(icon)
     controller.show()
     return app.exec()
-
 
 def _load_app_icon() -> QIcon:
     base_dir = Path(__file__).resolve().parent
@@ -1123,8 +591,7 @@ def _load_app_icon() -> QIcon:
         return QIcon(str(logo_path))
     if image.format() != QImage.Format.Format_ARGB32:
         image = image.convertToFormat(QImage.Format.Format_ARGB32)
-    w = image.width()
-    h = image.height()
+    w, h = image.width(), image.height()
     for y in range(h):
         for x in range(w):
             c = image.pixelColor(x, y)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import tempfile
 import time
@@ -9,6 +10,7 @@ from datetime import datetime
 import logging
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from typing import Callable, Any
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +87,11 @@ class GameEntry:
 class ArkosRepository:
     def __init__(self, roms_root: Path):
         self.roms_root = roms_root
+        self._games_cache: dict[str, tuple[str, list[GameEntry]]] = {}
 
     def set_root(self, roms_root: Path) -> None:
         self.roms_root = roms_root
+        self._games_cache.clear()
 
     def list_systems(self) -> list[str]:
         if not self.roms_root.exists():
@@ -119,7 +123,7 @@ class ArkosRepository:
                     if file_name not in {"gamelist.xml", "gamelist.xml.old"}:
                         return True
                 elem.clear()
-        except Exception:
+        except (ET.ParseError, OSError):
             return False
         return False
 
@@ -139,7 +143,33 @@ class ArkosRepository:
         clean = rel_path.strip()
         if clean.startswith("./"):
             clean = clean[2:]
-        return (self.system_dir(system) / clean).resolve()
+        base = self.system_dir(system).resolve()
+        resolved = (base / clean).resolve()
+        if not resolved.is_relative_to(base):
+            raise ValueError(f"非法路径，超出系统目录范围: {rel_path}")
+        return resolved
+
+    @staticmethod
+    def _clone_games(games: list[GameEntry]) -> list[GameEntry]:
+        return [GameEntry(path=item.path, fields=dict(item.fields)) for item in games]
+
+    def invalidate_system_cache(self, system: str) -> None:
+        self._games_cache.pop(system, None)
+
+    def _system_signature(self, system: str) -> str:
+        sys_dir = self.system_dir(system)
+        if not sys_dir.exists():
+            return "missing"
+        signature_items: list[str] = []
+        gamelist = self.gamelist_path(system)
+        if gamelist.exists():
+            stat = gamelist.stat()
+            signature_items.append(f"gamelist:{stat.st_mtime_ns}:{stat.st_size}")
+        for rom in self.list_rom_files(system):
+            stat = rom.stat()
+            signature_items.append(f"rom:{rom.name.lower()}:{stat.st_mtime_ns}:{stat.st_size}")
+        digest = hashlib.sha1("|".join(signature_items).encode("utf-8")).hexdigest()
+        return digest
 
     def list_rom_files(self, system: str) -> list[Path]:
         target = self.system_dir(system)
@@ -159,6 +189,10 @@ class ArkosRepository:
         return sorted(files, key=lambda p: p.name.lower())
 
     def load_games(self, system: str) -> list[GameEntry]:
+        signature = self._system_signature(system)
+        cached = self._games_cache.get(system)
+        if cached and cached[0] == signature:
+            return self._clone_games(cached[1])
         games: list[GameEntry] = []
         gpath = self.gamelist_path(system)
         if gpath.exists():
@@ -184,7 +218,9 @@ class ArkosRepository:
             rel = self.normalize_rel_path(rom.name)
             if rel not in existing_paths:
                 games.append(GameEntry(path=rel, fields={"name": rom.stem, "favorite": "false", "playcount": "0"}))
-        return sorted(games, key=lambda g: g.get("name", g.rom_name).lower())
+        ordered = sorted(games, key=lambda g: g.get("name", g.rom_name).lower())
+        self._games_cache[system] = (signature, self._clone_games(ordered))
+        return self._clone_games(ordered)
 
     def save_games(self, system: str, games: list[GameEntry]) -> None:
         start = time.perf_counter()
@@ -211,6 +247,7 @@ class ArkosRepository:
         if gamelist_file.exists():
             shutil.copy2(gamelist_file, old_backup_file)
         temp_file.replace(gamelist_file)
+        self.invalidate_system_cache(system)
         logger.info("写入gamelist完成: system=%s, games=%d, 耗时=%.3fs", system, len(ordered), time.perf_counter() - start)
 
 
@@ -239,18 +276,34 @@ class ArkosService:
         if norm_query:
             data = [g for g in data if norm_query in g.get("name", "").lower() or norm_query in g.path.lower()]
         reverse = "降序" in sort_text
+        def name_key(game: GameEntry) -> str:
+            return game.get("name", game.rom_name).lower()
+
+        def releasedate_key(game: GameEntry) -> str:
+            return game.get("releasedate", "")
+
+        def lastplayed_key(game: GameEntry) -> str:
+            return game.get("lastplayed", "")
+
+        def playcount_key(game: GameEntry) -> int:
+            return int(game.get("playcount", "0") or 0)
+
+        def rating_key(game: GameEntry) -> float:
+            return float(game.get("rating", "0") or 0)
+
+        key_fn: Callable[[GameEntry], Any]
         if sort_text.startswith("名称"):
-            key_fn = lambda g: g.get("name", g.rom_name).lower()
+            key_fn = name_key
         elif sort_text.startswith("发布日期"):
-            key_fn = lambda g: g.get("releasedate", "")
+            key_fn = releasedate_key
         elif sort_text.startswith("最后游玩"):
-            key_fn = lambda g: g.get("lastplayed", "")
+            key_fn = lastplayed_key
         elif sort_text.startswith("游玩次数"):
-            key_fn = lambda g: int(g.get("playcount", "0") or 0)
+            key_fn = playcount_key
         elif sort_text.startswith("评分"):
-            key_fn = lambda g: float(g.get("rating", "0") or 0)
+            key_fn = rating_key
         else:
-            key_fn = lambda g: g.get("name", g.rom_name).lower()
+            key_fn = name_key
         data.sort(key=key_fn, reverse=reverse)
         return data
 
@@ -302,18 +355,26 @@ class ArkosService:
         if target_game is None:
             raise FileNotFoundError(f"未找到目标游戏: {game.path}")
         changed = False
+        rollback_values: dict[str, tuple[str, str]] = {}
         for key, value in metadata.items():
             clean_value = value.strip()
             if key in {"image", "video", "thumbnail"} and clean_value:
                 clean_value = clean_value.replace("\\", "/")
             if target_game.get(key, "") != clean_value:
+                rollback_values[key] = (target_game.get(key, ""), game.get(key, ""))
                 target_game.set(key, clean_value)
                 game.set(key, clean_value)
                 changed = True
         if not changed:
             logger.info("元数据未变化，跳过保存: system=%s, game=%s", self.current_system, game.path)
             return False
-        self.repo.save_games(self.current_system, games)
+        try:
+            self.repo.save_games(self.current_system, games)
+        except OSError:
+            for key, old_values in rollback_values.items():
+                target_game.set(key, old_values[0])
+                game.set(key, old_values[1])
+            raise
         self.games = games
         logger.info("元数据保存完成: system=%s, game=%s, 耗时=%.3fs", self.current_system, game.path, time.perf_counter() - start)
         return True
@@ -333,7 +394,7 @@ class ArkosService:
             self.games.append(entry)
             self.persist_games()
             logger.info("ROM已添加: system=%s, rom=%s", self.current_system, entry.path)
-        except Exception:
+        except OSError:
             if dst.exists():
                 dst.unlink(missing_ok=True)
             raise
@@ -375,13 +436,13 @@ class ArkosService:
             self.repo.save_games(self.current_system, games)
             self.games = games
             shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
+        except (OSError, shutil.Error):
             for original, temp_loc in reversed(moved):
                 try:
                     original.parent.mkdir(parents=True, exist_ok=True)
                     if temp_loc.exists():
                         shutil.move(str(temp_loc), str(original))
-                except Exception:
+                except OSError:
                     pass
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise
@@ -443,12 +504,12 @@ class ArkosService:
                     game.set(media_key, new_value)
             self.repo.save_games(self.current_system, games)
             self.games = games
-        except Exception:
+        except (OSError, shutil.Error):
             for src, dst in reversed(renames):
                 try:
                     if dst.exists():
                         dst.rename(src)
-                except Exception:
+                except OSError:
                     pass
             target_game.path = old_rel
             game.path = old_rel
@@ -468,7 +529,7 @@ class ArkosService:
                     if path.is_file():
                         zf.write(path, arcname=str(path.relative_to(self.repo.roms_root)).replace("\\", "/"))
             return zip_file
-        except Exception:
+        except (OSError, RuntimeError):
             zip_file.unlink(missing_ok=True)
             raise
 
