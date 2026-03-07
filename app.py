@@ -13,6 +13,6 @@ def main() -> None:
     )
     sys.exit(run_app())
 
-
+#v1.0.0
 if __name__ == "__main__":
     main()
