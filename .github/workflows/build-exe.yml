@@ -2,37 +2,44 @@ name: Build Windows EXE & Create Release
 
 on:
   push:
-    branches:
-      - main
-      - master
-    tags:  # 新增：监听标签推送事件（标签格式如 v1.0.0）
-      - 'v*'
+    branches: [main, master]
+    tags: ['v*']  # 监听v开头的标签推送（触发Release创建）
   workflow_dispatch:  # 支持手动触发
 
 jobs:
   build-exe:
     runs-on: windows-latest
     timeout-minutes: 20
+    # 强化权限配置：解决403权限问题
+    permissions:
+      contents: write  # 必须：创建Release的核心权限
+      packages: write  # 可选：防止后续扩展权限不足
+      pull-requests: write  # 可选：兜底
 
     steps:
       - name: Checkout repository code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 拉取完整仓库历史，确保标签识别正常
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          # 如果你已创建requirements.txt，取消下面注释（否则保持注释）
+          # cache: "pip"
 
       - name: Install build dependencies
         run: |
-          echo "升级 pip 并安装依赖..."
+          echo "升级pip并安装依赖..."
           python -m pip install --upgrade pip
+          # 直接安装依赖（若有requirements.txt，替换为 pip install -r requirements.txt）
           pip install pyinstaller pillow PySide6 qtawesome --verbose
-        shell: pwsh
+        shell: pwsh  # 使用PowerShell提升Windows兼容性
 
       - name: Create necessary directories
         run: |
+          # 提前创建build和scripts目录，避免图标脚本报错
           if (-not (Test-Path "build")) { New-Item -ItemType Directory -Path "build" | Out-Null }
           if (-not (Test-Path "scripts")) { New-Item -ItemType Directory -Path "scripts" | Out-Null }
         shell: pwsh
@@ -42,12 +49,11 @@ jobs:
           echo "执行图标处理脚本..."
           python scripts/prepare_icon.py --source logo.png --output build
         shell: pwsh
-        # 可选：图标脚本非必须时，取消下面注释
-        # continue-on-error: true
+        continue-on-error: true  # 图标脚本失败不中断整体流程
 
       - name: Build EXE with PyInstaller
         run: |
-          echo "开始打包 EXE 文件..."
+          echo "开始打包EXE文件..."
           pyinstaller `
             --noconfirm `
             --clean `
@@ -63,10 +69,12 @@ jobs:
 
       - name: Verify EXE file exists
         run: |
+          # 验证EXE是否生成，提前报错便于排查
           if (-not (Test-Path "dist/ArkosGameMan.exe")) {
-            Write-Error "打包失败：未找到 dist/ArkosGameMan.exe 文件"
+            Write-Error "打包失败：未找到dist/ArkosGameMan.exe文件"
             exit 1
           }
+          # 输出EXE文件信息（大小、路径）
           Get-ChildItem dist/ArkosGameMan.exe | Format-List
         shell: pwsh
 
@@ -76,24 +84,19 @@ jobs:
           name: ArkosGameMan-windows-exe-${{ github.sha }}
           path: dist/ArkosGameMan.exe
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 30  # 产物保留30天
 
-      # 新增：仅当推送标签时，创建 Release 并上传 EXE 到 Release
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')  # 仅标签推送时执行
-        uses: softprops/action-gh-release@v2  # 第三方 Release 工具（稳定且易用）
+        uses: softprops/action-gh-release@v2
         with:
-          # Release 名称：使用标签名（如 v1.0.0）
-          name: ArkosGameMan ${{ github.ref_name }}
-          # Release 描述：可自定义，也可读取 CHANGELOG.md
+          name: ArkosGameMan ${{ github.ref_name }}  # Release名称（如ArkosGameMan v1.0.0）
           body: |
             ## ArkosGameMan ${{ github.ref_name }} 发布
-            - 自动构建的 Windows 可执行文件
+            - 自动构建的Windows可执行文件
             - 构建提交：${{ github.sha }}
-          # 附加 EXE 文件到 Release
-          files: dist/ArkosGameMan.exe
-          # 是否设为预发布（false 为正式发布，true 为预发布）
-          prerelease: false
+            - 构建时间：${{ github.event.repository.updated_at }}
+          files: ./dist/ArkosGameMan.exe  # 显式指定EXE路径（解决路径解析问题）
+          prerelease: false  # false=正式版，true=预发布版
         env:
-          # 必须：使用 GitHub 内置令牌授权创建 Release
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # 内置令牌（已授予读写权限）

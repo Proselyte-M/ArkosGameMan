@@ -318,16 +318,18 @@ class MainWindow(QMainWindow):
         self.games_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.games_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.games_table.setAlternatingRowColors(True)
+        self.games_table.setWordWrap(False)
         self.games_table.verticalHeader().setVisible(False)
         header = self.games_table.horizontalHeader()
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(True)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.games_table.setColumnWidth(0, 46)
+        self.games_table.setColumnWidth(1, 360)
+        self.games_table.setColumnWidth(2, 420)
+        self.games_table.setColumnWidth(3, 96)
+        self.games_table.setColumnWidth(4, 88)
+        self.games_table.setColumnWidth(5, 178)
         self.games_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         center_layout.addWidget(self.games_table, 1)
         main_splitter.addWidget(center_panel)
@@ -586,24 +588,47 @@ class MainWindow(QMainWindow):
 
     def set_games(self, rows: list[tuple[str, str, str, str, str, str]], group_rows: set[int] | None = None) -> None:
         groups = group_rows or set()
+        was_sorting = self.games_table.isSortingEnabled()
+        if was_sorting:
+            self.games_table.setSortingEnabled(False)
         self.games_table.blockSignals(True)
         self.games_table.setUpdatesEnabled(False)
+        self.games_table.clearContents()
         self.games_table.setRowCount(len(rows))
         for r, row in enumerate(rows):
+            is_group_row = r in groups
             for c, value in enumerate(row):
-                item = QTableWidgetItem(value)
-                if c == 0:
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if r in groups:
-                    item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                    item.setBackground(QColor(60, 78, 106, 95))
-                    if c in {0, 2, 3, 4, 5}:
-                        item.setText("")
+                item = self._build_game_item(value, c, is_group_row)
                 self.games_table.setItem(r, c, item)
         self.games_table.clearSelection()
         self.games_table.setCurrentCell(-1, -1)
         self.games_table.setUpdatesEnabled(True)
         self.games_table.blockSignals(False)
+        if was_sorting:
+            self.games_table.setSortingEnabled(True)
+
+    def update_game_row(self, row: int, values: tuple[str, str, str, str, str, str], is_group_row: bool = False) -> None:
+        if row < 0 or row >= self.games_table.rowCount():
+            return
+        self.games_table.blockSignals(True)
+        self.games_table.setUpdatesEnabled(False)
+        for c, value in enumerate(values):
+            item = self._build_game_item(value, c, is_group_row)
+            self.games_table.setItem(row, c, item)
+        self.games_table.setUpdatesEnabled(True)
+        self.games_table.blockSignals(False)
+
+    @staticmethod
+    def _build_game_item(value: str, column: int, is_group_row: bool) -> QTableWidgetItem:
+        item = QTableWidgetItem(value)
+        if column == 0:
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if is_group_row:
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            item.setBackground(QColor(60, 78, 106, 95))
+            if column in {0, 2, 3, 4, 5}:
+                item.setText("")
+        return item
 
     def set_header_sort_indicator(self, column: int, ascending: bool) -> None:
         order = Qt.SortOrder.AscendingOrder if ascending else Qt.SortOrder.DescendingOrder

@@ -7,9 +7,9 @@ import subprocess
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QPropertyAnimation, Qt, QUrl
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap
-from PySide6.QtWidgets import QApplication, QGraphicsOpacityEffect
+from PySide6.QtWidgets import QApplication
 
 from arkos_core import ArkosService, GameEntry
 from i18n import tr
@@ -33,6 +33,9 @@ class ArkosController:
         self._header_sort_asc = True
         self.current_theme = "dark"
         self.current_language = "zh"
+        self._theme_anim = QPropertyAnimation(self.view, b"windowOpacity", self.view)
+        self._theme_anim.setDuration(180)
+        self._theme_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
         self.view.set_root_path(str(initial_root))
         self.view.set_language(self.current_language)
         self._wire_signals()
@@ -341,6 +344,26 @@ class ArkosController:
                 self._on_game_selected(idx)
                 return
 
+    def _display_row_index(self, game: GameEntry) -> int:
+        for idx, displayed in enumerate(self.display_games):
+            if displayed is game:
+                return idx
+        return -1
+
+    def _should_refresh_after_save(
+        self,
+        query: str,
+        before_row: tuple[str, str, str, str, str, str],
+        after_row: tuple[str, str, str, str, str, str],
+    ) -> bool:
+        if self._mode in {"all", "favorites"}:
+            return True
+        if query:
+            return True
+        if self._header_sort_column is None:
+            return before_row[1] != after_row[1]
+        return before_row[self._header_sort_column] != after_row[self._header_sort_column]
+
     def _toggle_favorite_by_row(self, row: int) -> None:
         game = self._row_game(row)
         if game is None:
@@ -418,11 +441,23 @@ class ArkosController:
         try:
             start = time.perf_counter()
             self.view.set_busy(True, self._t("status.saving_metadata"))
+            before_row = self._game_to_row(self.selected_game)
+            query = self.view.search_edit.text().strip().lower()
             self.service.current_system = game_system
             changed = self.service.save_metadata(self.selected_game, data)
             if changed:
-                self._refresh_game_table()
-                self._select_game_by_path(self.selected_game.path)
+                after_row = self._game_to_row(self.selected_game)
+                need_refresh = self._should_refresh_after_save(query, before_row, after_row)
+                if need_refresh:
+                    self._refresh_game_table()
+                    self._select_game_by_path(self.selected_game.path)
+                else:
+                    row = self._display_row_index(self.selected_game)
+                    if row >= 0:
+                        self.view.update_game_row(row, after_row)
+                        self.view.games_table.setCurrentCell(row, 1)
+                        self.view.games_table.selectRow(row)
+                    self._refresh_preview(self.selected_game)
             self.view.set_busy(False, self._t("status.metadata_saved"))
             self.view.notify(self._t("notify.success"), self._t("notify.metadata_saved"))
             logger.info(
@@ -601,16 +636,16 @@ class ArkosController:
         if not qss_path.exists():
             return
         qss = qss_path.read_text(encoding="utf-8")
+        self._theme_anim.stop()
         if animate:
-            effect = QGraphicsOpacityEffect(self.view.centralWidget())
-            self.view.centralWidget().setGraphicsEffect(effect)
-            animation = QPropertyAnimation(effect, b"opacity")
-            animation.setDuration(180)
-            animation.setStartValue(0.4)
-            animation.setEndValue(1.0)
-            animation.start()
-            self.view._theme_anim = animation
+            self.view.setWindowOpacity(0.92)
+            self._theme_anim.setStartValue(0.92)
+            self._theme_anim.setEndValue(1.0)
         self.view.apply_stylesheet(qss)
+        if animate:
+            self._theme_anim.start()
+        else:
+            self.view.setWindowOpacity(1.0)
         if theme == "dark":
             self.view.btn_theme.setText(self._t("button.theme.dark"))
         else:
