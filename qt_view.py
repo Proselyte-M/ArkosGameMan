@@ -778,7 +778,7 @@ class MainWindow(QMainWindow):
     def open_batch_progress(self, title: str, total: int) -> "_BatchProgress":
         dialog = QProgressDialog("", "", 0, max(1, total), self)
         dialog.setWindowTitle(title)
-        dialog.setCancelButton(None)
+        dialog.setCancelButtonText("")
         dialog.setWindowModality(Qt.WindowModality.NonModal)
         dialog.setAutoClose(False)
         dialog.setAutoReset(False)
