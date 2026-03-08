@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from arkos_core import GameEntry
+from bios_loader import detect_bios_dir_from_rom, match_bios_files, should_enable_auto_bios
 from emulator_config import EmulatorConfigStore, EmulatorProfileConfig
 
 logger = logging.getLogger(__name__)
@@ -46,10 +47,11 @@ class EmulatorRunner:
         if not rom_abs.exists():
             self._notify(self._t("notify.failed"), self._t("notify.file_not_found", path=rom_abs), True)
             return
-        bundled_profiles = {"fc", "snes", "megadrive", "sega8", "segacd32x", "gb", "gba"}
+        bundled_profiles = {"fc", "snes", "megadrive", "sega8", "segacd32x", "gb", "gba", "cps"}
         if not conf.use_external and profile.profile_id in bundled_profiles:
             self._run_builtin_libretro(
                 profile.profile_id,
+                system,
                 rom_abs,
                 conf.key_profile,
                 conf.key_bindings,
@@ -110,6 +112,7 @@ class EmulatorRunner:
     def _run_builtin_libretro(
         self,
         profile_id: str,
+        system: str,
         rom_abs: Path,
         key_profile: str,
         key_bindings: str,
@@ -139,6 +142,7 @@ class EmulatorRunner:
         if launcher is None:
             self._notify(self._t("notify.failed"), self._t("notify.python_runtime_missing"), True)
             return
+        bios_dir = self._resolve_bios_dir(profile_id, system, rom_abs)
         try:
             prefix = [launcher] if isinstance(launcher, str) else launcher
             cmd = [
@@ -147,6 +151,8 @@ class EmulatorRunner:
                 str(rom_abs),
                 "--profile",
                 profile_id,
+                "--system",
+                system,
                 "--key-profile",
                 key_profile,
                 "--key-bindings",
@@ -162,6 +168,8 @@ class EmulatorRunner:
                 "--frame-sync",
                 frame_sync,
             ]
+            if bios_dir is not None:
+                cmd.extend(["--bios-dir", str(bios_dir)])
             subprocess.Popen(cmd, cwd=script_path.parent)
             logger.info(
                 "启动内置Libretro模拟器: profile=%s, rom=%s, script=%s, core=%s",
@@ -179,6 +187,27 @@ class EmulatorRunner:
             )
 
     @staticmethod
+    def _resolve_bios_dir(profile_id: str, system: str, rom_abs: Path) -> Path | None:
+        if not should_enable_auto_bios(profile_id):
+            return None
+        bios_dir = detect_bios_dir_from_rom(rom_abs)
+        if bios_dir is None:
+            logger.warning("未检测到BIOS目录: profile=%s, system=%s, rom=%s", profile_id, system, rom_abs)
+            return None
+        matched, missing = match_bios_files(profile_id, system, bios_dir)
+        if matched:
+            names = ", ".join(path.name for path in matched)
+            logger.info("检测到街机BIOS: profile=%s, system=%s, bios=%s", profile_id, system, names)
+        if missing:
+            logger.warning(
+                "BIOS缺失，可能影响街机启动: profile=%s, system=%s, missing=%s",
+                profile_id,
+                system,
+                ", ".join(missing),
+            )
+        return bios_dir
+
+    @staticmethod
     def _resolve_bundled_core(profile_id: str, base_dir: Path, core_override_dll: str = "") -> Path | None:
         core_map = {
             "fc": "quicknes_libretro.dll",
@@ -188,6 +217,7 @@ class EmulatorRunner:
             "segacd32x": "picodrive_libretro.dll",
             "gb": "mgba_libretro.dll",
             "gba": "mgba_libretro.dll",
+            "cps": "fbneo_libretro.dll",
         }
         override = core_override_dll.strip()
         if profile_id in {"gb", "gba"} and override.lower() == "vbam_libretro.dll":

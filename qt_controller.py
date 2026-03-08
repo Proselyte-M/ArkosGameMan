@@ -6,10 +6,11 @@ import logging
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, QUrl
+from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import QApplication
 
@@ -19,7 +20,6 @@ from emulator_config import EmulatorConfigStore
 from game_actions import (
     ControllerGameActionsMixin,
     build_table,
-    collect_games_all_systems,
     game_to_row,
     should_refresh_after_save,
 )
@@ -29,6 +29,11 @@ from update_service import UpdateService
 from version import APP_VERSION
 
 logger = logging.getLogger(__name__)
+
+
+class _SavePendingBridge(QObject):
+    save_succeeded = Signal(int, list)
+    save_failed = Signal(int, str)
 
 
 class ArkosController(ControllerGameActionsMixin):
@@ -42,8 +47,24 @@ class ArkosController(ControllerGameActionsMixin):
         self.selected_game: GameEntry | None = None
         self._systems: list[str] = []
         self._mode = "system"
+        self._is_normalizing_names = False
         self._header_sort_column: int | None = None
         self._header_sort_asc = True
+        self._memory_games_by_system: dict[str, list[GameEntry]] = {}
+        self._dirty_systems: set[str] = set()
+        self._pending_changes: dict[str, dict[str, str]] = {}
+        self._save_lock = threading.Lock()
+        self._is_saving_pending = False
+        self._save_timeout_ms = 15000
+        self._save_request_seq = 0
+        self._active_save_request_seq = 0
+        self._save_timeout_timer = QTimer(self.view)
+        self._save_timeout_timer.setSingleShot(True)
+        self._save_timeout_timer.timeout.connect(self._on_save_pending_timeout)
+        self._save_pending_bridge = _SavePendingBridge()
+        self._save_pending_bridge.save_succeeded.connect(self._on_save_pending_succeeded)
+        self._save_pending_bridge.save_failed.connect(self._on_save_pending_failed)
+        self._last_system_label = ""
         self.current_theme = "dark"
         self.current_language = "zh"
         self._emulator_store = EmulatorConfigStore(self._settings_file)
@@ -76,6 +97,7 @@ class ArkosController(ControllerGameActionsMixin):
         )
         self.view.set_root_path(str(initial_root))
         self.view.set_language(self.current_language)
+        self.view.set_close_guard(self._handle_close_guard)
         self._wire_signals()
         self._apply_theme(self.current_theme, animate=False)
         self._refresh_systems()
@@ -176,6 +198,7 @@ class ArkosController(ControllerGameActionsMixin):
         self.view.request_choose_root.connect(self._choose_root)
         self.view.request_refresh_systems.connect(self._refresh_systems)
         self.view.request_backup_saves.connect(self._backup_saves)
+        self.view.request_normalize_names.connect(self._normalize_game_names)
         self.view.request_add_rom.connect(self._add_rom)
         self.view.request_delete_game.connect(self._delete_game)
         self.view.request_rename_game.connect(self._rename_game)
@@ -192,6 +215,251 @@ class ArkosController(ControllerGameActionsMixin):
         self.view.request_language_changed.connect(self._on_language_changed)
         self.view.request_open_emulator_settings.connect(self._open_emulator_settings)
         self.view.request_run_game_by_row.connect(self._run_game_by_row)
+        self.view.request_save_pending.connect(self._save_pending_changes_clicked)
+        self.view.request_reset_pending.connect(self._reset_pending_changes)
+
+    @staticmethod
+    def _clone_game(entry: GameEntry, system: str) -> GameEntry:
+        fields = dict(entry.fields)
+        fields["__system__"] = system
+        return GameEntry(path=entry.path, fields=fields)
+
+    @staticmethod
+    def _norm_rel_path(path: str) -> str:
+        clean = path.strip().replace("\\", "/")
+        if clean.startswith("./"):
+            clean = clean[2:]
+        return clean
+
+    def _load_system_cache(self, system: str) -> list[GameEntry]:
+        cached = self._memory_games_by_system.get(system)
+        if cached is not None:
+            return cached
+        loaded = [self._clone_game(game, system) for game in self.service.repo.load_games(system)]
+        self._memory_games_by_system[system] = loaded
+        return loaded
+
+    def _reload_all_system_caches(self) -> None:
+        self._memory_games_by_system = {
+            system: [self._clone_game(game, system) for game in self.service.repo.load_games(system)]
+            for system in self._systems
+        }
+
+    def _pending_change_key(self, system: str, rel_path: str) -> str:
+        return f"{system}|{self._norm_rel_path(rel_path)}"
+
+    def _pending_count(self) -> int:
+        return len(self._pending_changes)
+
+    def _refresh_pending_action_state(self) -> None:
+        enabled = self._pending_count() > 0 and not self._is_saving_pending and not self._is_normalizing_names
+        self.view.set_pending_actions_enabled(enabled)
+
+    def _bind_mode_games_from_cache(self) -> None:
+        if self._mode == "all":
+            merged: list[GameEntry] = []
+            for system in self._systems:
+                merged.extend(self._load_system_cache(system))
+            self.service.games = merged
+            self.service.current_system = ""
+            return
+        if self._mode == "favorites":
+            merged = []
+            for system in self._systems:
+                for game in self._load_system_cache(system):
+                    if game.get("favorite", "false").lower() == "true":
+                        merged.append(game)
+            self.service.games = merged
+            self.service.current_system = ""
+            return
+        if self.service.current_system:
+            self.service.games = self._load_system_cache(self.service.current_system)
+
+    def _find_cache_game(self, game_system: str, rel_path: str) -> GameEntry | None:
+        target = self._norm_rel_path(rel_path)
+        for game in self._load_system_cache(game_system):
+            if self._norm_rel_path(game.path) == target:
+                return game
+        return None
+
+    def _stage_metadata_update(self, game: GameEntry, game_system: str, data: dict[str, str]) -> bool:
+        self.service.validate_metadata(data)
+        target = self._find_cache_game(game_system, game.path)
+        if target is None:
+            raise FileNotFoundError(f"未找到目标游戏: {game.path}")
+        changed = False
+        updated = dict(data)
+        for key, value in updated.items():
+            clean = value.strip()
+            if key in {"image", "video", "thumbnail"} and clean:
+                clean = clean.replace("\\", "/")
+            if target.get(key, "") != clean:
+                target.set(key, clean)
+                changed = True
+            updated[key] = clean
+        if not changed:
+            return False
+        game.fields = dict(target.fields)
+        key = self._pending_change_key(game_system, target.path)
+        self._pending_changes[key] = {"system": game_system, "path": target.path}
+        self._dirty_systems.add(game_system)
+        self._refresh_pending_action_state()
+        return True
+
+    def _save_pending_snapshot(self) -> dict[str, list[GameEntry]]:
+        return {system: [self._clone_game(item, system) for item in self._load_system_cache(system)] for system in self._dirty_systems}
+
+    def _apply_save_success(self, saved_systems: list[str]) -> None:
+        self._pending_changes.clear()
+        self._dirty_systems.clear()
+        self._is_saving_pending = False
+        self._save_timeout_timer.stop()
+        self.view.set_save_pending_state(False)
+        self._refresh_pending_action_state()
+        self._refresh_game_table()
+        self.view.notify(self._t("notify.success"), self._t("notify.pending_saved", systems=len(saved_systems)))
+
+    def _apply_save_failed(self, error: str) -> None:
+        self._is_saving_pending = False
+        self._save_timeout_timer.stop()
+        self.view.set_save_pending_state(False)
+        self._refresh_pending_action_state()
+        self.view.notify(self._t("notify.failed"), self._t("notify.pending_save_failed", error=error), error=True)
+
+    def _on_save_pending_succeeded(self, request_seq: int, saved_systems: list[str]) -> None:
+        if request_seq != self._active_save_request_seq:
+            return
+        self._apply_save_success(saved_systems)
+
+    def _on_save_pending_failed(self, request_seq: int, error: str) -> None:
+        if request_seq != self._active_save_request_seq:
+            return
+        self._apply_save_failed(error)
+
+    def _on_save_pending_timeout(self) -> None:
+        if not self._is_saving_pending:
+            return
+        self._active_save_request_seq += 1
+        self._apply_save_failed(self._t("notify.pending_save_timeout"))
+
+    def _save_pending_worker(self, request_seq: int, snapshot: dict[str, list[GameEntry]]) -> None:
+        try:
+            saved_systems = self._write_snapshot_with_rollback(snapshot)
+            self._save_pending_bridge.save_succeeded.emit(request_seq, saved_systems)
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            error_text = str(exc)
+            self._save_pending_bridge.save_failed.emit(request_seq, error_text)
+        except Exception as exc:  # noqa: BLE001
+            self._save_pending_bridge.save_failed.emit(request_seq, str(exc))
+        finally:
+            self._save_lock.release()
+
+    def _write_snapshot_with_rollback(self, snapshot: dict[str, list[GameEntry]]) -> list[str]:
+        backups: dict[str, bytes | None] = {}
+        saved_systems: list[str] = []
+        for system in snapshot:
+            gpath = self.service.repo.gamelist_path(system)
+            backups[system] = gpath.read_bytes() if gpath.exists() else None
+        try:
+            for system, games in snapshot.items():
+                ordered = sorted(games, key=lambda g: g.get("name", g.rom_name).lower())
+                self.service.repo.save_games(system, ordered)
+                saved_systems.append(system)
+            return saved_systems
+        except (OSError, ValueError, FileNotFoundError):
+            for system in saved_systems:
+                gpath = self.service.repo.gamelist_path(system)
+                before = backups.get(system)
+                if before is None:
+                    gpath.unlink(missing_ok=True)
+                    self.service.repo.invalidate_system_cache(system)
+                    continue
+                rollback_tmp = gpath.with_suffix(".xml.rollback.tmp")
+                rollback_tmp.parent.mkdir(parents=True, exist_ok=True)
+                rollback_tmp.write_bytes(before)
+                rollback_tmp.replace(gpath)
+                self.service.repo.invalidate_system_cache(system)
+            raise
+
+    def _save_pending_to_disk(self, async_mode: bool) -> bool:
+        if self._pending_count() == 0:
+            self.view.notify(self._t("notify.tip"), self._t("notify.no_pending_changes"))
+            return True
+        if not self._save_lock.acquire(blocking=False):
+            self.view.notify(self._t("notify.tip"), self._t("notify.pending_save_in_progress"))
+            return False
+        snapshot = self._save_pending_snapshot()
+        self._is_saving_pending = True
+        self.view.set_save_pending_state(True)
+        self._refresh_pending_action_state()
+        if async_mode:
+            self._save_request_seq += 1
+            request_seq = self._save_request_seq
+            self._active_save_request_seq = request_seq
+            self._save_timeout_timer.start(self._save_timeout_ms)
+            worker = threading.Thread(target=self._save_pending_worker, args=(request_seq, snapshot), daemon=True)
+            worker.start()
+            return True
+        try:
+            saved_systems = self._write_snapshot_with_rollback(snapshot)
+            self._apply_save_success(saved_systems)
+            return True
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            self._apply_save_failed(str(exc))
+            return False
+        finally:
+            self._save_lock.release()
+
+    def _save_pending_changes_clicked(self) -> None:
+        pending = self._pending_count()
+        if pending == 0:
+            self.view.notify(self._t("notify.tip"), self._t("notify.no_pending_changes"))
+            return
+        if not self.view.ask_yes_no(
+            self._t("dialog.save_pending_confirm_title"),
+            self._t("dialog.save_pending_confirm", count=pending),
+        ):
+            return
+        self._save_pending_to_disk(async_mode=True)
+
+    def _discard_pending_changes(self) -> None:
+        self._pending_changes.clear()
+        self._dirty_systems.clear()
+        self._reload_all_system_caches()
+        self._bind_mode_games_from_cache()
+        self._refresh_game_table()
+        self._refresh_pending_action_state()
+        self.view.notify(self._t("notify.success"), self._t("notify.pending_reset_done"))
+
+    def _reset_pending_changes(self) -> None:
+        pending = self._pending_count()
+        if pending == 0:
+            self.view.notify(self._t("notify.tip"), self._t("notify.no_pending_changes"))
+            return
+        if not self.view.ask_yes_no(
+            self._t("dialog.reset_pending_confirm_title"),
+            self._t("dialog.reset_pending_confirm", count=pending),
+        ):
+            return
+        self._discard_pending_changes()
+
+    def _handle_unsaved_before_navigation(self) -> bool:
+        pending = self._pending_count()
+        if pending == 0:
+            return True
+        action = self.view.ask_save_discard_cancel(
+            self._t("dialog.unsaved_title"),
+            self._t("dialog.unsaved_message", count=pending),
+        )
+        if action == "cancel":
+            return False
+        if action == "discard":
+            self._discard_pending_changes()
+            return True
+        return self._save_pending_to_disk(async_mode=False)
+
+    def _handle_close_guard(self) -> bool:
+        return self._handle_unsaved_before_navigation()
 
     def _schedule_refresh(self, *_args) -> None:
         self._search_debounce.start()
@@ -200,6 +468,8 @@ class ArkosController(ControllerGameActionsMixin):
         self.view.show()
 
     def _choose_root(self) -> None:
+        if not self._handle_unsaved_before_navigation():
+            return
         selected = self.view.choose_directory()
         if not selected:
             return
@@ -220,12 +490,19 @@ class ArkosController(ControllerGameActionsMixin):
             self.view.set_task_progress(self._t("status.refreshing_systems"), 2, 3)
             systems = self.service.list_systems()
             self._systems = systems[:]
+            self._reload_all_system_caches()
             self.view.set_systems([self._t("system.all_games"), self._t("system.favorites"), *systems])
             self.selected_game = None
             self.filtered_games = []
             self.display_games = []
             self._mode = "all"
-            self.view.set_games([], set())
+            self.service.current_system = ""
+            self._bind_mode_games_from_cache()
+            self._pending_changes.clear()
+            self._dirty_systems.clear()
+            self._refresh_game_table()
+            self._refresh_pending_action_state()
+            self._last_system_label = self._t("system.all_games")
             self.view.clear_edit_form()
             self.view.set_task_progress(self._t("status.systems_refreshed"), 3, 3)
             self.view.set_busy(False, self._t("status.systems_refreshed"))
@@ -238,6 +515,13 @@ class ArkosController(ControllerGameActionsMixin):
     def _on_system_changed(self, system: str) -> None:
         if not system:
             return
+        if system != self._last_system_label and not self._handle_unsaved_before_navigation():
+            self.view.system_list.blockSignals(True)
+            idx = self.view.system_list.findItems(self._last_system_label, Qt.MatchFlag.MatchExactly)
+            if idx:
+                self.view.system_list.setCurrentItem(idx[0])
+            self.view.system_list.blockSignals(False)
+            return
         start = time.perf_counter()
         logger.info("切换系统: %s", system)
         self.view.set_busy(True, self._t("status.loading_games"))
@@ -246,28 +530,20 @@ class ArkosController(ControllerGameActionsMixin):
             if system == self._t("system.all_games"):
                 self._mode = "all"
                 self.service.current_system = ""
-                self.service.games = collect_games_all_systems(
-                    systems=self._systems,
-                    load_games=self.service.repo.load_games,
-                    favorites_only=False,
-                )
             elif system == self._t("system.favorites"):
                 self._mode = "favorites"
                 self.service.current_system = ""
-                self.service.games = collect_games_all_systems(
-                    systems=self._systems,
-                    load_games=self.service.repo.load_games,
-                    favorites_only=True,
-                )
             else:
                 self._mode = "system"
-                self.service.select_system(system)
+                self.service.current_system = system
+            self._bind_mode_games_from_cache()
             self.selected_game = None
             self._header_sort_column = None
             self._header_sort_asc = True
             self.view.clear_edit_form()
             self.view.set_task_progress(self._t("status.loading_games"), 2, 3)
             self._refresh_game_table()
+            self._last_system_label = system
             self.view.set_task_progress(f"{system} {self._t('status.ready')}", 3, 3)
             self.view.set_busy(False, f"{system} {self._t('status.ready')}")
             logger.info("系统加载完成: %s, 模式=%s, 耗时=%.3fs", system, self._mode, time.perf_counter() - start)
@@ -278,18 +554,7 @@ class ArkosController(ControllerGameActionsMixin):
 
     def _refresh_game_table(self, *_args) -> None:
         start = time.perf_counter()
-        if self._mode == "all":
-            self.service.games = collect_games_all_systems(
-                systems=self._systems,
-                load_games=self.service.repo.load_games,
-                favorites_only=False,
-            )
-        elif self._mode == "favorites":
-            self.service.games = collect_games_all_systems(
-                systems=self._systems,
-                load_games=self.service.repo.load_games,
-                favorites_only=True,
-            )
+        self._bind_mode_games_from_cache()
         table = build_table(
             mode=self._mode,
             source_games=self.service.games,
@@ -429,8 +694,7 @@ class ArkosController(ControllerGameActionsMixin):
         current = data.get("favorite", "false").lower() == "true"
         data["favorite"] = "false" if current else "true"
         try:
-            self.service.current_system = game_system
-            self.service.save_metadata(game, data)
+            self._stage_metadata_update(game, game_system, data)
             if self.selected_game is game:
                 self.selected_game.set("favorite", data["favorite"])
             self._refresh_game_table()
@@ -497,8 +761,7 @@ class ArkosController(ControllerGameActionsMixin):
             self.view.set_busy(True, self._t("status.saving_metadata"))
             before_row = game_to_row(self.selected_game, self._mode)
             query = self.view.search_edit.text().strip().lower()
-            self.service.current_system = game_system
-            changed = self.service.save_metadata(self.selected_game, data)
+            changed = self._stage_metadata_update(self.selected_game, game_system, data)
             if changed:
                 after_row = game_to_row(self.selected_game, self._mode)
                 need_refresh = should_refresh_after_save(
@@ -519,6 +782,7 @@ class ArkosController(ControllerGameActionsMixin):
                         self.view.games_table.selectRow(row)
                     self._refresh_preview(self.selected_game)
             self.view.set_busy(False, self._t("status.metadata_saved"))
+            self._refresh_pending_action_state()
             self.view.notify(self._t("notify.success"), self._t("notify.metadata_saved"))
             logger.info(
                 "保存元数据完成: system=%s, game=%s, changed=%s, 耗时=%.3fs",
@@ -535,8 +799,21 @@ class ArkosController(ControllerGameActionsMixin):
     def _on_language_changed(self, lang: str) -> None:
         self.current_language = lang
         self.view.set_language(lang)
-        self._refresh_systems()
+        selected_system = self.service.current_system
+        self.view.set_systems([self._t("system.all_games"), self._t("system.favorites"), *self._systems])
+        if self._mode == "all":
+            self._last_system_label = self._t("system.all_games")
+        elif self._mode == "favorites":
+            self._last_system_label = self._t("system.favorites")
+        else:
+            self._last_system_label = selected_system
+        items = self.view.system_list.findItems(self._last_system_label, Qt.MatchFlag.MatchExactly)
+        if items:
+            self.view.system_list.blockSignals(True)
+            self.view.system_list.setCurrentItem(items[0])
+            self.view.system_list.blockSignals(False)
         self._refresh_game_table()
+        self._refresh_pending_action_state()
 
     def _toggle_theme(self) -> None:
         self.current_theme = "light" if self.current_theme == "dark" else "dark"

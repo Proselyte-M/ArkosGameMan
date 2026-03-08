@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TypeAlias
+from typing import Callable, TypeAlias
 
 from PySide6.QtCore import QEasingCurve, Property, QPropertyAnimation, QRectF, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -226,11 +227,26 @@ class IosSwitch(QCheckBox):
         painter.drawEllipse(knob_rect)
 
 
+class _BatchProgress:
+    def __init__(self, dialog: QProgressDialog) -> None:
+        self._dialog = dialog
+
+    def update(self, text: str, value: int) -> None:
+        self._dialog.setLabelText(text)
+        self._dialog.setValue(value)
+        QApplication.processEvents()
+
+    def close(self) -> None:
+        self._dialog.close()
+        QApplication.processEvents()
+
+
 class MainWindow(QMainWindow):
     request_choose_root = Signal()
     request_refresh_systems = Signal()
     request_backup_saves = Signal()
     request_add_rom = Signal()
+    request_normalize_names = Signal()
     request_delete_game = Signal()
     request_rename_game = Signal()
     request_save_metadata = Signal()
@@ -246,10 +262,13 @@ class MainWindow(QMainWindow):
     request_language_changed = Signal(str)
     request_open_emulator_settings = Signal()
     request_run_game_by_row = Signal(int)
+    request_save_pending = Signal()
+    request_reset_pending = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self._lang = "zh"
+        self._close_guard: Callable[[], bool] | None = None
         self.setWindowTitle(self._t("app.title"))
         self.resize(1560, 960)
         self.setMinimumSize(1180, 700)
@@ -332,14 +351,22 @@ class MainWindow(QMainWindow):
         self.toggle_show_preview_image = IosSwitch()
         self.toggle_show_preview_image.setChecked(True)
         self.btn_add = QPushButton(self._icon("fa5s.plus"), self._t("button.add_rom"))
+        self.btn_normalize = QPushButton(self._icon("fa5s.magic"), self._t("button.normalize_names"))
         self.btn_delete = QPushButton(self._icon("fa5s.trash"), self._t("button.delete_game"))
         self.btn_rename = QPushButton(self._icon("fa5s.i-cursor"), self._t("button.rename_rom"))
+        self.btn_save_pending = QPushButton(self._icon("fa5s.save"), self._t("button.save_pending"))
+        self.btn_reset_pending = QPushButton(self._icon("fa5s.undo"), self._t("button.reset_pending"))
+        self.btn_save_pending.setEnabled(False)
+        self.btn_reset_pending.setEnabled(False)
         control_row.addWidget(self.preview_switch_label)
         control_row.addWidget(self.toggle_show_preview_image)
         control_row.addStretch(1)
+        control_row.addWidget(self.btn_normalize)
         control_row.addWidget(self.btn_add)
         control_row.addWidget(self.btn_delete)
         control_row.addWidget(self.btn_rename)
+        control_row.addWidget(self.btn_reset_pending)
+        control_row.addWidget(self.btn_save_pending)
         center_layout.addLayout(control_row)
         self.games_table = QTableWidget(0, 6)
         self.games_table.setHorizontalHeaderLabels(
@@ -495,10 +522,13 @@ class MainWindow(QMainWindow):
         self.btn_choose_root.clicked.connect(self.request_choose_root.emit)
         self.btn_refresh.clicked.connect(self.request_refresh_systems.emit)
         self.btn_backup.clicked.connect(self.request_backup_saves.emit)
+        self.btn_normalize.clicked.connect(self.request_normalize_names.emit)
         self.btn_add.clicked.connect(self.request_add_rom.emit)
         self.btn_delete.clicked.connect(self.request_delete_game.emit)
         self.btn_rename.clicked.connect(self.request_rename_game.emit)
         self.btn_save.clicked.connect(self.request_save_metadata.emit)
+        self.btn_save_pending.clicked.connect(self.request_save_pending.emit)
+        self.btn_reset_pending.clicked.connect(self.request_reset_pending.emit)
         self.system_list.currentTextChanged.connect(self.request_system_changed.emit)
         self.search_edit.textChanged.connect(self.request_search_or_sort.emit)
         self.toggle_show_preview_image.toggled.connect(self._on_toggle_show_preview_image)
@@ -591,10 +621,13 @@ class MainWindow(QMainWindow):
         self.btn_choose_root.setText(self._t("button.choose_root"))
         self.btn_refresh.setText(self._t("button.refresh_systems"))
         self.btn_backup.setText(self._t("button.backup_saves"))
+        self.btn_normalize.setText(self._t("button.normalize_names"))
         self.btn_add.setText(self._t("button.add_rom"))
         self.btn_delete.setText(self._t("button.delete_game"))
         self.btn_rename.setText(self._t("button.rename_rom"))
         self.btn_save.setText(self._t("button.save_metadata"))
+        self.btn_save_pending.setText(self._t("button.save_pending"))
+        self.btn_reset_pending.setText(self._t("button.reset_pending"))
         self.btn_theme.setToolTip(self._t("button.theme.tooltip"))
         self.btn_settings.setToolTip(self._t("button.settings.tooltip"))
         self.left_title.setText(self._t("title.system_list"))
@@ -732,8 +765,50 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, title, message)
 
+    def notify_highlight_list(self, title: str, summary: str, items: list[str]) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle(title)
+        parts = [summary, "<br><br>"]
+        for item in items:
+            parts.append(f"<span style='color:#ff4d4f'>• {item}</span><br>")
+        box.setText("".join(parts))
+        box.exec()
+
+    def open_batch_progress(self, title: str, total: int) -> "_BatchProgress":
+        dialog = QProgressDialog("", "", 0, max(1, total), self)
+        dialog.setWindowTitle(title)
+        dialog.setCancelButton(None)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumDuration(0)
+        dialog.setValue(0)
+        dialog.show()
+        QApplication.processEvents()
+        return _BatchProgress(dialog)
+
     def ask_yes_no(self, title: str, message: str) -> bool:
         return QMessageBox.question(self, title, message) == QMessageBox.StandardButton.Yes
+
+    def ask_save_discard_cancel(self, title: str, message: str) -> str:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(title)
+        box.setText(message)
+        save_btn = box.addButton(self._t("dialog.unsaved_save"), QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = box.addButton(self._t("dialog.unsaved_discard"), QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton(self._t("dialog.unsaved_cancel"), QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(save_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is save_btn:
+            return "save"
+        if clicked is discard_btn:
+            return "discard"
+        if clicked is cancel_btn:
+            return "cancel"
+        return "cancel"
 
     def ask_text(self, title: str, label: str, value: str) -> str:
         from PySide6.QtWidgets import QInputDialog
@@ -874,3 +949,24 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if isinstance(app, QApplication):
             app.setStyleSheet(qss)
+
+    def set_pending_actions_enabled(self, enabled: bool) -> None:
+        self.btn_save_pending.setEnabled(enabled)
+        self.btn_reset_pending.setEnabled(enabled)
+
+    def set_save_pending_state(self, saving: bool) -> None:
+        if saving:
+            self.btn_save_pending.setText(self._t("button.saving_pending"))
+            self.btn_save_pending.setEnabled(False)
+            self.btn_reset_pending.setEnabled(False)
+            return
+        self.btn_save_pending.setText(self._t("button.save_pending"))
+
+    def set_close_guard(self, guard: Callable[[], bool]) -> None:
+        self._close_guard = guard
+
+    def closeEvent(self, event) -> None:
+        if self._close_guard is not None and not self._close_guard():
+            event.ignore()
+            return
+        super().closeEvent(event)

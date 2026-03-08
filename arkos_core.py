@@ -447,73 +447,24 @@ class ArkosService:
             shutil.rmtree(tmpdir, ignore_errors=True)
             raise
 
-    def rename_game(self, game: GameEntry, new_stem: str) -> None:
+    def rename_game(self, game: GameEntry, new_stem: str, persist: bool = True) -> None:
         games = self._load_current_system_games()
         target_game = self._find_game_by_path(games, game.path)
         if target_game is None:
             raise FileNotFoundError(f"未找到目标游戏: {game.path}")
-        old_rel = target_game.path
-        old_stem = Path(old_rel).stem
-        old_ext = Path(old_rel).suffix
-        new_name = f"{new_stem}{old_ext}"
-        new_rel = self.repo.normalize_rel_path(new_name)
-        old_abs = self.repo.rel_to_abs(self.current_system, old_rel)
-        new_abs = self.repo.rel_to_abs(self.current_system, new_rel)
-        if new_abs.exists():
-            raise FileExistsError("目标 ROM 文件已存在。")
-        renames: list[tuple[Path, Path]] = []
-        try:
-            old_abs.rename(new_abs)
-            renames.append((old_abs, new_abs))
-            saves_dir = self.repo.saves_dir(self.current_system)
-            if saves_dir.exists():
-                for sf in saves_dir.iterdir():
-                    if sf.is_file() and (sf.stem == old_stem or sf.name.startswith(f"{old_stem}.")):
-                        suffix = sf.name[len(old_stem) :]
-                        target = saves_dir / f"{new_stem}{suffix}"
-                        if target.exists():
-                            raise FileExistsError(f"存档目标已存在: {target.name}")
-                        sf.rename(target)
-                        renames.append((sf, target))
-            media_root = self.repo.system_dir(self.current_system) / "media"
-            if media_root.exists():
-                for folder in MEDIA_SUBDIRS:
-                    d = media_root / folder
-                    if not d.exists():
-                        continue
-                    for mf in d.iterdir():
-                        if mf.is_file() and mf.stem == old_stem:
-                            target = d / f"{new_stem}{mf.suffix}"
-                            if target.exists():
-                                raise FileExistsError(f"媒体目标已存在: {target.name}")
-                            mf.rename(target)
-                            renames.append((mf, target))
-            target_game.path = new_rel
-            game.path = new_rel
-            if target_game.get("name", "") == old_stem:
-                target_game.set("name", new_stem)
-                game.set("name", new_stem)
-            for media_key in ("image", "video", "thumbnail"):
-                value = target_game.get(media_key, "").strip()
-                if not value:
-                    continue
-                p = Path(value)
-                if p.stem == old_stem:
-                    new_value = value.replace(f"/{old_stem}.", f"/{new_stem}.")
-                    target_game.set(media_key, new_value)
-                    game.set(media_key, new_value)
-            self.repo.save_games(self.current_system, games)
-            self.games = games
-        except (OSError, shutil.Error):
-            for src, dst in reversed(renames):
-                try:
-                    if dst.exists():
-                        dst.rename(src)
-                except OSError:
-                    pass
-            target_game.path = old_rel
-            game.path = old_rel
-            raise
+        old_name = target_game.get("name", Path(target_game.path).stem)
+        if old_name == new_stem:
+            return
+        target_game.set("name", new_stem)
+        game.set("name", new_stem)
+        self.games = games
+        if persist:
+            try:
+                self.repo.save_games(self.current_system, games)
+            except OSError:
+                target_game.set("name", old_name)
+                game.set("name", old_name)
+                raise
 
     def backup_saves(self) -> Path:
         saves_root = self.repo.roms_root / "saves"

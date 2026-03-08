@@ -16,6 +16,7 @@ from PySide6.QtCore import QIODevice, QRect, Qt, QTimer
 from PySide6.QtGui import QImage, QKeyEvent, QPainter
 from PySide6.QtMultimedia import QAudioFormat, QAudioSink
 from PySide6.QtWidgets import QApplication, QWidget
+from bios_loader import detect_bios_dir_from_rom, match_bios_files
 
 RETRO_DEVICE_JOYPAD = 1
 RETRO_DEVICE_ID_JOYPAD_B = 0
@@ -121,7 +122,9 @@ def build_input_mapping(key_profile: str, key_bindings: str) -> dict[int, int]:
 RETRO_PIXEL_FORMAT_0RGB1555 = 0
 RETRO_PIXEL_FORMAT_XRGB8888 = 1
 RETRO_PIXEL_FORMAT_RGB565 = 2
+RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY = 9
 RETRO_ENVIRONMENT_SET_PIXEL_FORMAT = 10
+RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY = 31
 
 ENV_CB = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_uint, ctypes.c_void_p)
 VIDEO_CB = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_size_t)
@@ -217,7 +220,14 @@ class AudioQueueDevice(QIODevice):
 
 
 class LibretroCore:
-    def __init__(self, core_path: Path, input_mapping: dict[int, int], audio_latency_ms: int):
+    def __init__(
+        self,
+        core_path: Path,
+        input_mapping: dict[int, int],
+        audio_latency_ms: int,
+        system_dir: Path | None = None,
+        save_dir: Path | None = None,
+    ):
         self.dll = ctypes.CDLL(str(core_path))
         self.pixel_format = RETRO_PIXEL_FORMAT_XRGB8888
         self.keys: set[int] = set()
@@ -234,6 +244,16 @@ class LibretroCore:
         self._audio_batch_cb = AUDIO_BATCH_CB(self._on_audio_batch)
         self._input_poll_cb = INPUT_POLL_CB(self._on_input_poll)
         self._input_state_cb = INPUT_STATE_CB(self._on_input_state)
+        self.system_dir = system_dir
+        self.save_dir = save_dir
+        self._system_dir_ptr: ctypes.c_char_p | None = None
+        self._save_dir_ptr: ctypes.c_char_p | None = None
+        if self.system_dir is not None:
+            self.system_dir.mkdir(parents=True, exist_ok=True)
+            self._system_dir_ptr = ctypes.c_char_p(os.fsencode(str(self.system_dir)))
+        if self.save_dir is not None:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+            self._save_dir_ptr = ctypes.c_char_p(os.fsencode(str(self.save_dir)))
         self._bind_api()
 
     def _bind_api(self) -> None:
@@ -319,6 +339,14 @@ class LibretroCore:
             self.audio_sink.stop()
 
     def _on_environment(self, cmd: int, data: int) -> bool:
+        if cmd == RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY and data and self._system_dir_ptr is not None:
+            target = ctypes.cast(data, ctypes.POINTER(ctypes.c_char_p))
+            target[0] = self._system_dir_ptr
+            return True
+        if cmd == RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY and data and self._save_dir_ptr is not None:
+            target = ctypes.cast(data, ctypes.POINTER(ctypes.c_char_p))
+            target[0] = self._save_dir_ptr
+            return True
         if cmd == RETRO_ENVIRONMENT_SET_PIXEL_FORMAT and data:
             self.pixel_format = ctypes.cast(data, ctypes.POINTER(ctypes.c_int)).contents.value
             return True
@@ -448,6 +476,7 @@ def resolve_core(profile: str, base_dir: Path) -> Path:
         "segacd32x": "picodrive_libretro.dll",
         "gb": "mgba_libretro.dll",
         "gba": "mgba_libretro.dll",
+        "cps": "fbneo_libretro.dll",
     }
     dll = mapping.get(profile)
     if dll is None:
@@ -487,6 +516,7 @@ def _profile_zip_exts(profile: str) -> tuple[str, ...]:
         "segacd32x": (".cue", ".iso", ".bin", ".md", ".32x"),
         "gb": (".gb", ".gbc"),
         "gba": (".gba",),
+        "cps": (".zip",),
     }
     return mapping.get(profile, ())
 
@@ -527,7 +557,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("rom_path")
     parser.add_argument("--profile", default="fc")
+    parser.add_argument("--system", default="")
     parser.add_argument("--base-dir", default=str(Path(__file__).resolve().parent))
+    parser.add_argument("--bios-dir", default="")
     parser.add_argument("--key-profile", default="default")
     parser.add_argument("--key-bindings", default="")
     parser.add_argument("--core-path", default="")
@@ -542,6 +574,17 @@ def main() -> int:
         return 1
     profile = args.profile.lower()
     base_dir = Path(args.base_dir)
+    system_name = args.system.strip().lower()
+    explicit_bios_dir = args.bios_dir.strip()
+    bios_dir = Path(explicit_bios_dir) if explicit_bios_dir else detect_bios_dir_from_rom(rom_path)
+    if bios_dir is not None:
+        matched_bios, missing_bios = match_bios_files(profile, system_name, bios_dir)
+        if matched_bios:
+            print(f"检测到BIOS目录: {bios_dir}")
+            print(f"已匹配BIOS: {', '.join(path.name for path in matched_bios)}")
+        elif missing_bios:
+            print(f"检测到BIOS目录: {bios_dir}")
+            print(f"未匹配到目标BIOS: {', '.join(missing_bios)}")
     try:
         core_candidates = resolve_core_candidates(profile, base_dir, args.core_path)
     except Exception as exc:
@@ -564,7 +607,7 @@ def main() -> int:
     fps = 60.0
     for core_path in core_candidates:
         try:
-            host = LibretroCore(core_path, input_mapping, args.audio_latency_ms)
+            host = LibretroCore(core_path, input_mapping, args.audio_latency_ms, system_dir=bios_dir, save_dir=rom_path.parent)
             fps = host.setup()
             host.load_game(prepared_path)
             print(f"使用核心启动成功: {core_path.name}")

@@ -305,6 +305,7 @@ class EmulatorSettingsDialog(QDialog):
             "segacd32x": "picodrive_libretro.dll",
             "gb": "mgba_libretro.dll",
             "gba": "mgba_libretro.dll",
+            "cps": "fbneo_libretro.dll",
         }
         for item in default_map.values():
             if item not in dlls:
@@ -344,6 +345,7 @@ class EmulatorSettingsDialog(QDialog):
             "segacd32x": "picodrive_libretro.dll",
             "gb": "mgba_libretro.dll",
             "gba": "mgba_libretro.dll",
+            "cps": "fbneo_libretro.dll",
         }
         return mapping.get(profile_id, "")
 
